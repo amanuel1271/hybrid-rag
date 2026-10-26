@@ -1,0 +1,8 @@
+{
+  "vector":  {"recall@5": 0.91, "mrr": 0.85},
+  "keyword": {"recall@5": 0.97, "mrr": 0.84},
+  "hybrid":  {"recall@5": 1.0,  "mrr": 0.91},
+  "rerank":  {"recall@1": 0.91, "recall@5": 1.0, "mrr": 0.95},
+  "extractive":     {"correct": 0.77},
+  "qwen+guardrail": {"correct": 0.88}
+}

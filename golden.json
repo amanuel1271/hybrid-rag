@@ -1,142 +1,333 @@
 [
  {
   "question": "What does error SHP-4031 mean?",
-  "doc": "error-codes.md"
+  "doc": "error-codes.md",
+  "facts": [
+   [
+    "address"
+   ]
+  ]
  },
  {
   "question": "Is SHP-5003 safe to retry?",
-  "doc": "error-codes.md"
+  "doc": "error-codes.md",
+  "facts": [
+   [
+    "backoff"
+   ]
+  ]
  },
  {
   "question": "What should a client do on SHP-4090?",
-  "doc": "error-codes.md"
+  "doc": "error-codes.md",
+  "facts": [
+   [
+    "success",
+    "original booking"
+   ]
+  ]
  },
  {
   "question": "What command rolls back a deploy with orbit deploy?",
-  "doc": "deploy-process.md"
+  "doc": "deploy-process.md",
+  "facts": [
+   [
+    "orbit deploy rollback"
+   ]
+  ]
  },
  {
   "question": "Which ticket queue handles rate limit changes?",
-  "doc": "api-rate-limits.md"
+  "doc": "api-rate-limits.md",
+  "facts": [
+   [
+    "limits"
+   ]
+  ]
  },
  {
   "question": "What does orbit dev up do for new engineers?",
-  "doc": "onboarding.md"
+  "doc": "onboarding.md",
+  "facts": [
+   [
+    "local environment"
+   ]
+  ]
  },
  {
   "question": "What is booking.split-shipments.rollout an example of?",
-  "doc": "feature-flags.md"
+  "doc": "feature-flags.md",
+  "facts": [
+   [
+    "flag"
+   ]
+  ]
  },
  {
   "question": "What are hotfix branches named?",
-  "doc": "deploy-process.md"
+  "doc": "deploy-process.md",
+  "facts": [
+   [
+    "hotfix/"
+   ]
+  ]
  },
  {
   "question": "When is SHP-5020 returned?",
-  "doc": "error-codes.md"
+  "doc": "error-codes.md",
+  "facts": [
+   [
+    "pricing"
+   ]
+  ]
  },
  {
   "question": "Which project do SEV3 tickets go into?",
-  "doc": "incident-severity.md"
+  "doc": "incident-severity.md",
+  "facts": [
+   [
+    "reliability"
+   ]
+  ]
  },
  {
   "question": "If I miss a page, how long until someone else gets alerted?",
-  "doc": "oncall-runbook.md"
+  "doc": "oncall-runbook.md",
+  "facts": [
+   [
+    "10 minutes"
+   ]
+  ]
  },
  {
   "question": "Can I keep vacation days I didn't use this year?",
-  "doc": "pto-policy.md"
+  "doc": "pto-policy.md",
+  "facts": [
+   [
+    "5"
+   ],
+   [
+    "carr"
+   ]
+  ]
  },
  {
   "question": "How much can I spend on a new monitor or desk chair?",
-  "doc": "expense-policy.md"
+  "doc": "expense-policy.md",
+  "facts": [
+   [
+    "1500000"
+   ]
+  ]
  },
  {
   "question": "Someone pushed an API key to GitHub by accident, what now?",
-  "doc": "secrets-rotation.md"
+  "doc": "secrets-rotation.md",
+  "facts": [
+   [
+    "revoke",
+    "rotate"
+   ]
+  ]
  },
  {
   "question": "How fast do we need to be able to bring the bookings database back?",
-  "doc": "database-backups.md"
+  "doc": "database-backups.md",
+  "facts": [
+   [
+    "45 minutes"
+   ]
+  ]
  },
  {
   "question": "Do I get paid extra for being on call?",
-  "doc": "oncall-runbook.md"
+  "doc": "oncall-runbook.md",
+  "facts": [
+   [
+    "150000"
+   ]
+  ]
  },
  {
   "question": "Am I allowed to ship code on a Friday afternoon?",
-  "doc": "deploy-process.md"
+  "doc": "deploy-process.md",
+  "facts": [
+   [
+    "14:00"
+   ]
+  ]
  },
  {
   "question": "A customer's package went missing, what do they get back?",
-  "doc": "refunds.md"
+  "doc": "refunds.md",
+  "facts": [
+   [
+    "full refund"
+   ]
+  ]
  },
  {
   "question": "How long do we hold on to customer addresses?",
-  "doc": "data-retention.md"
+  "doc": "data-retention.md",
+  "facts": [
+   [
+    "5 years"
+   ]
+  ]
  },
  {
   "question": "How many reviewers does a change to the login code need?",
-  "doc": "code-review.md"
+  "doc": "code-review.md",
+  "facts": [
+   [
+    "two",
+    "2 approvals",
+    "2 reviewers"
+   ]
+  ]
  },
  {
   "question": "As a new hire, when can I query the production database?",
-  "doc": "onboarding.md"
+  "doc": "onboarding.md",
+  "facts": [
+   [
+    "30 days"
+   ]
+  ]
  },
  {
   "question": "How big should a pull request be?",
-  "doc": "code-review.md"
+  "doc": "code-review.md",
+  "facts": [
+   [
+    "400"
+   ]
+  ]
  },
  {
   "question": "How long do we have to erase someone's personal data when they ask?",
-  "doc": "data-retention.md"
+  "doc": "data-retention.md",
+  "facts": [
+   [
+    "30 days"
+   ]
+  ]
  },
  {
   "question": "What slowness counts as a SEV2?",
-  "doc": "incident-severity.md"
+  "doc": "incident-severity.md",
+  "facts": [
+   [
+    "2 seconds"
+   ]
+  ]
  },
  {
   "question": "Can support staff raise a customer's API quota themselves?",
-  "doc": "api-rate-limits.md"
+  "doc": "api-rate-limits.md",
+  "facts": [
+   [
+    "limits",
+    "must not",
+    "not change"
+   ]
+  ]
  },
  {
   "question": "Do I need permission before flying to a conference?",
-  "doc": "expense-policy.md"
+  "doc": "expense-policy.md",
+  "facts": [
+   [
+    "approval"
+   ]
+  ]
  },
  {
   "question": "How often do database passwords change?",
-  "doc": "secrets-rotation.md"
+  "doc": "secrets-rotation.md",
+  "facts": [
+   [
+    "90 days"
+   ]
+  ]
  },
  {
   "question": "How long does new code run on a small slice of traffic before full rollout?",
-  "doc": "deploy-process.md"
+  "doc": "deploy-process.md",
+  "facts": [
+   [
+    "20 minutes"
+   ]
+  ]
  },
  {
   "question": "How many requests per second does a free account get?",
-  "doc": "api-rate-limits.md"
+  "doc": "api-rate-limits.md",
+  "facts": [
+   [
+    "10 requests"
+   ]
+  ]
  },
  {
   "question": "What refund does a customer get for cancelling the morning of pickup?",
-  "doc": "refunds.md"
+  "doc": "refunds.md",
+  "facts": [
+   [
+    "50%",
+    "50 percent",
+    "half"
+   ]
+  ]
  },
  {
   "question": "When must a fully rolled-out flag be deleted from the code?",
-  "doc": "feature-flags.md"
+  "doc": "feature-flags.md",
+  "facts": [
+   [
+    "30 days"
+   ]
+  ]
  },
  {
   "question": "How long do I have to file a receipt?",
-  "doc": "expense-policy.md"
+  "doc": "expense-policy.md",
+  "facts": [
+   [
+    "60 days"
+   ]
+  ]
  },
  {
   "question": "How often do we practice restoring backups?",
-  "doc": "database-backups.md"
+  "doc": "database-backups.md",
+  "facts": [
+   [
+    "month",
+    "first tuesday"
+   ]
+  ]
  },
  {
   "question": "How long are application logs kept?",
-  "doc": "data-retention.md"
+  "doc": "data-retention.md",
+  "facts": [
+   [
+    "30 days"
+   ],
+   [
+    "1 year",
+    "one year"
+   ]
+  ]
  },
  {
   "question": "How many sick days do I get?",
-  "doc": "pto-policy.md"
+  "doc": "pto-policy.md",
+  "facts": [
+   [
+    "10"
+   ]
+  ]
  }
 ]

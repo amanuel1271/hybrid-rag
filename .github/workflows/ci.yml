@@ -38,5 +38,6 @@ jobs:
       - run: pip install -r requirements.txt
       - name: tests
         run: pytest -q
-      - name: retrieval eval
-        run: python eval.py | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: eval regression gate (retrieval + extractive answers vs eval_baseline.json)
+        shell: bash   # -o pipefail: a failed check must fail the step even through tee
+        run: python eval.py --check | tee -a "$GITHUB_STEP_SUMMARY"

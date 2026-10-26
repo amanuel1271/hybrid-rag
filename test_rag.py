@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 import rag
 from app import DATABASE_URL, DOCS_DIR, app
-from eval import evaluate
+from eval import evaluate, is_correct, regressions
 
 PASSAGES = [
     {"doc": "refunds.md", "content": "Customer Refunds - Processing\nRefunds are issued to the original payment "
@@ -118,3 +118,19 @@ def test_ask_returns_a_verified_llm_answer(client, monkeypatch):
 
 def test_ask_rejects_empty_question(client):
     assert client.post("/ask", json={"question": ""}).status_code == 422
+
+
+@pytest.mark.parametrize("answer, facts, want", [
+    ("Escalates after 10 minutes [1].", [["10 minutes"]], True),
+    ("Kept for 30 days hot, 1 year cold.", [["30 days"], ["1 year", "one year"]], True),
+    ("Kept for 30 days.", [["30 days"], ["1 year", "one year"]], False),
+    ("Budget is 1,500,000 KRW.", [["1500000"]], True),  # commas ignored
+])
+def test_answer_correctness_needs_every_fact_group(answer, facts, want):
+    assert is_correct(answer, facts) is want
+
+
+def test_regression_gate_flags_only_real_drops():
+    baseline = {"rerank": {"mrr": 0.95}, "qwen+guardrail": {"correct": 0.88}}
+    assert regressions({"rerank": {"mrr": 0.951}}, baseline) == []          # missing group (no LLM in CI) is skipped
+    assert regressions({"rerank": {"mrr": 0.92}}, baseline) == ["rerank.mrr: 0.920 < baseline 0.950"]

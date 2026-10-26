@@ -37,6 +37,20 @@ Vector search misses exact codes (3 of 35); keyword search misses a paraphrase. 
 
 The corpus and questions are small and written by me, so read these as relative gains, not absolute quality.
 
+## Answer quality: measured
+
+Each golden question lists the facts a correct answer must contain (e.g. "10 minutes", "LIMITS"); an answer is correct if it contains all of them. `python eval.py --llm` asks all 35 through `/ask`:
+
+| answers | correct | falls back to extractive |
+|---|---|---|
+| extractive only (no LLM) | 0.77 | 100% |
+| Qwen 2.5 3B, raw | 0.80 | – |
+| **Qwen + claim-check guardrail** | **0.89** | 20% |
+
+20% of Qwen's raw answers failed the claim check (uncited, unsupported, or wrong numbers) and were replaced by a quoted sentence, which turned 3 wrong answers into right ones. The 4 still wrong: the fallback quoting the wrong sentence twice (API-key leak, same-day cancellation), Qwen abstaining although the answer was retrieved (support raising quotas), and a canary question answered with the feature-flag rollout stages. Those are the next things to fix.
+
+**CI gate:** `python eval.py --check` fails the build if any retrieval metric or extractive answer correctness drops below [`eval_baseline.json`](eval_baseline.json). Qwen metrics are checked locally (`--llm --check`), since CI has no LLM. Verified by breaking the extractive fallback: the gate exits 1 with `extractive.correct: 0.000 < baseline 0.770`.
+
 ## How the answer check works
 
 | Rule | Enforced by |
@@ -86,7 +100,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-25 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, and a hallucinated LLM answer being replaced. Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
+30 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring and the regression gate. Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
 
 ## Trade-offs
 
@@ -95,3 +109,17 @@ docker compose run --rm -v "$PWD":/app api pytest -q
 - **The extractive fallback quotes one sentence.** It picked the answering sentence for 27 of the 35 golden questions; answers that need two sentences come out partial.
 - **Postgres full-text instead of BM25.** `ts_rank_cd` over an OR query is close enough here and keeps everything in one database; a dedicated BM25 index would rank long documents better.
 - **Model calls run in a thread pool** so one slow `/ask` doesn't block other requests; under real load they belong in a separate worker with batching.
+
+## Roadmap
+
+Built one feature at a time, each with tests, eval numbers and green CI.
+
+- [x] Hybrid retrieval, rerank, cited answers, claim checker, extractive guardrail
+- [x] Answer-quality eval + CI regression gate
+- [ ] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
+- [ ] Streaming answers (SSE)
+- [ ] Entailment (NLI) claim check for "must" vs "must not"
+- [ ] Multi-hop questions: let the model search again (tool use)
+- [ ] Document-level access control + prompt-injection guard for untrusted docs
+- [ ] Semantic cache + PDF/HTML ingest
+- [ ] Fine-tune the embedding model on the corpus and measure the lift
