@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rag
+          POSTGRES_PASSWORD: rag
+          POSTGRES_DB: rag
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rag"
+          --health-interval 2s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql://rag:rag@localhost:5432/rag
+      FASTEMBED_CACHE_PATH: /home/runner/models
+      OLLAMA_URL: http://127.0.0.1:9   # no LLM in CI: /ask must fall back to the extractive answer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/models
+          key: models-bge-small-en-v1.5-ms-marco-MiniLM-L-6-v2
+      - run: pip install -r requirements.txt
+      - name: tests
+        run: pytest -q
+      - name: retrieval eval
+        run: python eval.py | tee -a "$GITHUB_STEP_SUMMARY"
