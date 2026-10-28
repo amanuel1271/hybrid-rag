@@ -134,3 +134,26 @@ def test_regression_gate_flags_only_real_drops():
     baseline = {"rerank": {"mrr": 0.95}, "qwen+guardrail": {"correct": 0.88}}
     assert regressions({"rerank": {"mrr": 0.951}}, baseline) == []          # missing group (no LLM in CI) is skipped
     assert regressions({"rerank": {"mrr": 0.92}}, baseline) == ["rerank.mrr: 0.920 < baseline 0.950"]
+
+
+def test_percentile_nearest_rank():
+    assert rag.percentile([5, 1, 3, 2, 4], 50) == 3
+    assert rag.percentile(range(1, 101), 95) == 95
+    assert rag.percentile([7], 95) == 7
+
+
+def test_timed_records_stage_even_when_it_raises():
+    before = len(rag.SAMPLES["unit_test_stage"])
+    with pytest.raises(ValueError):
+        with rag.timed("unit_test_stage"):
+            raise ValueError
+    assert len(rag.SAMPLES["unit_test_stage"]) == before + 1
+
+
+def test_ask_exports_stage_latency_and_answer_metrics(client, monkeypatch):
+    monkeypatch.setattr(rag, "OLLAMA_URL", "http://127.0.0.1:9")
+    client.post("/ask", json={"question": "How long do refunds take?"})
+    metrics = client.get("/metrics").text
+    for stage in ("embed", "vector_db", "keyword_db", "rerank", "llm", "extractive", "ask_total"):
+        assert f'rag_stage_seconds_count{{stage="{stage}"}}' in metrics
+    assert 'rag_answers_total{engine="extractive",verified="true"}' in metrics

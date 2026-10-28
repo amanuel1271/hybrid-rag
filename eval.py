@@ -4,6 +4,8 @@
   python eval.py           retrieval + extractive answers (no LLM needed)
   python eval.py --llm     also Qwen answers, raw and behind the guardrail (needs Ollama)
   python eval.py --check   fail (exit 1) if any metric drops below eval_baseline.json
+
+Also prints per-stage latency (p50/p95). Not gated: CI machines vary too much for timing floors.
 """
 import json
 import re
@@ -96,6 +98,10 @@ def report(results: dict) -> None:
             r = results[engine]
             raw = lambda key: f"{r[key]:.2f}" if key in r else "-"
             print(f"| {engine} | {r['correct']:.2f} | {r['fallback_rate']:.2f} | {raw('llm_raw_correct')} | {raw('llm_raw_verified')} |")
+    print("\n| stage | calls | p50 ms | p95 ms |\n|---|---|---|---|")
+    for stage, samples in sorted(rag.SAMPLES.items()):
+        p50, p95 = (rag.percentile(samples, q) * 1000 for q in (50, 95))
+        print(f"| {stage} | {len(samples)} | {p50:.1f} | {p95:.1f} |")
     for engine in ("extractive", "qwen+guardrail"):
         for miss in results.get(engine, {}).get("misses", []):
             print(f"  miss ({engine}): {miss}")

@@ -7,8 +7,12 @@ question -> vector search (pgvector) + keyword search (Postgres full-text)
 """
 import asyncio
 import hashlib
+import math
 import os
 import re
+import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
 
@@ -16,6 +20,7 @@ import httpx
 import numpy as np
 from fastembed import TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
+from prometheus_client import Histogram
 
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dims, runs locally on CPU
 RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
@@ -28,6 +33,30 @@ MODEL_CACHE = os.environ.get("FASTEMBED_CACHE_PATH")
 IDK = "I don't know."
 CITE = r"\[\d+(?:\s*[,\-]\s*\d+)*\]"  # [1], [1][2], [1, 2], [1-3]
 SENTENCE_END = r"(?<=[.!?])(?<!e\.g\.)(?<!i\.e\.)\s+|\n+"
+
+
+# Per-stage latency: a Prometheus histogram for /metrics, plus recent raw samples for exact
+# p50/p95 in eval.py. ponytail: in-process samples, per-worker; Prometheus is the cross-worker view.
+STAGE_SECONDS = Histogram("rag_stage_seconds", "Time spent in each pipeline stage", ["stage"],
+                          buckets=(.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60))
+SAMPLES: dict[str, deque] = defaultdict(lambda: deque(maxlen=5000))
+
+
+@contextmanager
+def timed(stage: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        seconds = time.perf_counter() - start
+        STAGE_SECONDS.labels(stage).observe(seconds)
+        SAMPLES[stage].append(seconds)
+
+
+def percentile(values, q: float) -> float:
+    """Nearest-rank percentile (q in 0..100) of a non-empty sequence."""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q / 100 * len(ordered)) - 1)]
 
 
 @cache
@@ -82,20 +111,23 @@ async def ingest(conn, docs_dir: Path) -> int:
 
 
 async def vector_search(conn, question: str, limit: int = CANDIDATES) -> list[int]:
-    [qv] = await asyncio.to_thread(embed, [question])
-    rows = await conn.fetch(
-        "SELECT id FROM chunks ORDER BY embedding <=> $1::vector LIMIT $2", to_pgvector(qv), limit)
+    with timed("embed"):
+        [qv] = await asyncio.to_thread(embed, [question])
+    with timed("vector_db"):
+        rows = await conn.fetch(
+            "SELECT id FROM chunks ORDER BY embedding <=> $1::vector LIMIT $2", to_pgvector(qv), limit)
     return [r["id"] for r in rows]
 
 
 async def keyword_search(conn, question: str, limit: int = CANDIDATES) -> list[int]:
     # OR the question's terms (plainto_tsquery ANDs them, which misses on long questions);
     # ts_rank_cd then rewards chunks matching more terms, closer together.
-    rows = await conn.fetch(
-        """SELECT id FROM chunks,
-                  (SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS q) t
-           WHERE tsv @@ t.q ORDER BY ts_rank_cd(tsv, t.q) DESC LIMIT $2""",
-        question, limit)
+    with timed("keyword_db"):
+        rows = await conn.fetch(
+            """SELECT id FROM chunks,
+                      (SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS q) t
+               WHERE tsv @@ t.q ORDER BY ts_rank_cd(tsv, t.q) DESC LIMIT $2""",
+            question, limit)
     return [r["id"] for r in rows]
 
 
@@ -126,7 +158,8 @@ async def search(conn, question: str, mode: str = "rerank", k: int = 5) -> list[
         raise ValueError(f"unknown search mode: {mode}")
     passages = await fetch_chunks(conn, ids if mode == "rerank" else ids[:k])
     if mode == "rerank" and passages:
-        scores = await asyncio.to_thread(lambda: list(reranker().rerank(question, [p["content"] for p in passages])))
+        with timed("rerank"):
+            scores = await asyncio.to_thread(lambda: list(reranker().rerank(question, [p["content"] for p in passages])))
         for p, s in zip(passages, scores):
             p["score"] = float(s)
         passages.sort(key=lambda p: p["score"], reverse=True)
@@ -147,12 +180,13 @@ async def generate(question: str, passages: list[dict]) -> str | None:
     """Qwen via Ollama. Returns None when the model is unavailable (caller falls back)."""
     numbered = "\n\n".join(f"[{i}] {p['content']}" for i, p in enumerate(passages, start=1))
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{OLLAMA_URL}/api/generate", json={
-                "model": OLLAMA_MODEL, "stream": False, "options": {"temperature": 0},
-                "prompt": PROMPT.format(passages=numbered, question=question)})
-            r.raise_for_status()
-            return r.json()["response"].strip() or None
+        with timed("llm"):
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(f"{OLLAMA_URL}/api/generate", json={
+                    "model": OLLAMA_MODEL, "stream": False, "options": {"temperature": 0},
+                    "prompt": PROMPT.format(passages=numbered, question=question)})
+        r.raise_for_status()
+        return r.json()["response"].strip() or None
     except (httpx.HTTPError, KeyError, ValueError):
         return None
 

@@ -51,6 +51,31 @@ Each golden question lists the facts a correct answer must contain (e.g. "10 min
 
 **CI gate:** `python eval.py --check` fails the build if any retrieval metric or extractive answer correctness drops below [`eval_baseline.json`](eval_baseline.json). Qwen metrics are checked locally (`--llm --check`), since CI has no LLM. Verified by breaking the extractive fallback: the gate exits 1 with `extractive.correct: 0.000 < baseline 0.770`.
 
+## Latency: measured
+
+Every pipeline stage is timed (`rag.timed`) into a Prometheus histogram, exported at `GET /metrics`, and `eval.py` prints p50/p95 from the same timings. Measured on a laptop (Apple M2 CPU, Docker), 35 golden questions through `/ask`:
+
+| stage | p50 ms | p95 ms | note |
+|---|---|---|---|
+| embed (query) | 4.2 | 9.8 | bge-small, CPU |
+| vector search (pgvector HNSW) | 0.5 | 1.9 | |
+| keyword search (Postgres FTS) | 0.2 | 0.5 | |
+| rerank (cross-encoder, up to 40 fused candidates) | 181 | 315 | the slowest non-LLM stage |
+| LLM answer (Qwen 2.5 3B) | 1,530 | 3,255 | |
+| claim check | 46 | 91 | |
+| **whole `/ask`, with LLM** | **1,796** | **3,621** | |
+| whole `/ask`, extractive only | 235 | 487 | no LLM |
+
+What it says: retrieval in Postgres is almost free (under 2 ms at p95). Without the LLM, the cross-encoder is about two-thirds of the request, so it's the first thing to batch, cap or move to a GPU. With the LLM, generation is about 85% of the time, which is why streaming (next on the roadmap) matters more than any retrieval tuning.
+
+Each `/ask` also writes one JSON log line (no question text, which may hold user data):
+
+```json
+{"event": "ask", "engine": "qwen", "verified": true, "llm_rejected": false, "passages": 5, "ms": 1712.4}
+```
+
+and increments `rag_answers_total{engine, verified}`, so the fallback rate can be graphed and alerted on.
+
 ## How the answer check works
 
 | Rule | Enforced by |
@@ -92,6 +117,7 @@ Point it at your own docs with `DOCS_DIR` (one chunk per `##` section). Re-inges
 | `GET /search?q=&mode=&k=` | `mode` = `vector`, `keyword`, `hybrid` or `rerank` (default) |
 | `POST /ask` | `{"question": ...}` returns answer, engine (`qwen` or `extractive`), per-claim checks and sources |
 | `GET /health` | chunk count |
+| `GET /metrics` | Prometheus: `rag_stage_seconds{stage}` histograms, `rag_answers_total{engine,verified}` |
 
 ## Tests
 
@@ -100,7 +126,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-30 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring and the regression gate. Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
+33 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, and per-stage latency metrics (including a stage that raises). Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
 
 ## Trade-offs
 
@@ -116,7 +142,7 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 
 - [x] Hybrid retrieval, rerank, cited answers, claim checker, extractive guardrail
 - [x] Answer-quality eval + CI regression gate
-- [ ] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
+- [x] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
 - [ ] Streaming answers (SSE)
 - [ ] Entailment (NLI) claim check for "must" vs "must not"
 - [ ] Multi-hop questions: let the model search again (tool use)
