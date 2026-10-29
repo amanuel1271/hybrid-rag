@@ -66,7 +66,29 @@ Every pipeline stage is timed (`rag.timed`) into a Prometheus histogram, exporte
 | **whole `/ask`, with LLM** | **1,796** | **3,621** | |
 | whole `/ask`, extractive only | 235 | 487 | no LLM |
 
-What it says: retrieval in Postgres is almost free (under 2 ms at p95). Without the LLM, the cross-encoder is about two-thirds of the request, so it's the first thing to batch, cap or move to a GPU. With the LLM, generation is about 85% of the time, which is why streaming (next on the roadmap) matters more than any retrieval tuning.
+What it says: retrieval in Postgres is almost free (under 2 ms at p95). Without the LLM, the cross-encoder is about two-thirds of the request, so it's the first thing to batch, cap or move to a GPU. With the LLM, generation is about 85% of the time, which is why streaming matters more than any retrieval tuning.
+
+## Streaming: show text early, keep the check
+
+`POST /ask/stream` sends Server-Sent Events. The claim check needs the whole answer, so streamed text is a **draft**: the last event carries the checked answer, and if the draft fails the check, the UI swaps it for the extractive one.
+
+```
+event: sources   ->  retrieved passages, right after rerank
+event: token     ->  {"text": "SHP-5003 is safe "}   (many)
+event: final     ->  same body as /ask: answer, engine, verified, claims, sources
+```
+
+If the model dies mid-answer (timeout, error line, or the stream closes without Ollama's `done`), the draft is thrown away and `final` is the extractive answer. A cut-off sentence is never checked as if it were complete.
+
+Same laptop, same 35 questions, measured at the client:
+
+| event | p50 ms | p95 ms |
+|---|---|---|
+| sources | 208 | 441 |
+| first token | 1,065 | 1,503 |
+| final (checked answer) | 1,940 | 4,041 |
+
+So the user sees sources at 0.2 s and words at about 1.1 s, instead of a blank screen for about 2 s. The first-token wait is mostly the 3B model reading the 5 passages on CPU. The cost: 7 of the 35 drafts failed the check and were replaced, so a UI should style streamed text as provisional until `final`. Time to first token is exported as `rag_stage_seconds{stage="first_token"}`.
 
 Each `/ask` also writes one JSON log line (no question text, which may hold user data):
 
@@ -97,6 +119,8 @@ curl 'localhost:8000/search?q=SHP-4031&k=3'
 curl 'localhost:8000/search?q=who+gets+paged+if+I+miss+an+alert&mode=vector'
 curl -X POST localhost:8000/ask -H 'content-type: application/json' \
   -d '{"question": "Is SHP-5003 safe to retry?"}'
+curl -N -X POST localhost:8000/ask/stream -H 'content-type: application/json' \
+  -d '{"question": "Is SHP-5003 safe to retry?"}'
 ```
 
 ```json
@@ -116,6 +140,7 @@ Point it at your own docs with `DOCS_DIR` (one chunk per `##` section). Re-inges
 |---|---|
 | `GET /search?q=&mode=&k=` | `mode` = `vector`, `keyword`, `hybrid` or `rerank` (default) |
 | `POST /ask` | `{"question": ...}` returns answer, engine (`qwen` or `extractive`), per-claim checks and sources |
+| `POST /ask/stream` | same, as Server-Sent Events: `sources`, `token`s (draft), `final` (checked) |
 | `GET /health` | chunk count |
 | `GET /metrics` | Prometheus: `rag_stage_seconds{stage}` histograms, `rag_answers_total{engine,verified}` |
 
@@ -126,7 +151,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-33 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, and per-stage latency metrics (including a stage that raises). Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
+36 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), and streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`). Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
 
 ## Trade-offs
 
@@ -143,7 +168,7 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Hybrid retrieval, rerank, cited answers, claim checker, extractive guardrail
 - [x] Answer-quality eval + CI regression gate
 - [x] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
-- [ ] Streaming answers (SSE)
+- [x] Streaming answers (SSE), with the claim check still deciding the final answer
 - [ ] Entailment (NLI) claim check for "must" vs "must not"
 - [ ] Multi-hop questions: let the model search again (tool use)
 - [ ] Document-level access control + prompt-injection guard for untrusted docs

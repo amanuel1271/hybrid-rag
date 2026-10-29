@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Literal
 
 import asyncpg
+import httpx
 from fastapi import FastAPI, Query, Response
+from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
@@ -67,28 +69,62 @@ async def ask(body: AskRequest):
         async with app.state.pool.acquire() as conn:
             passages = await rag.search(conn, body.question)
         answer = await rag.generate(body.question, passages)
-        with rag.timed("verify"):
-            claims = await asyncio.to_thread(rag.verify, answer, passages) if answer else []
-        engine, rejected = "qwen", None
-        # Guardrail: never return an LLM answer that is empty or fails verification; fall back to an
-        # extractive answer quoted from the top passages, and show what was rejected and why.
-        if answer is None or not rag.strip_citations(answer) or not all(c["supported"] for c in claims):
-            if answer is not None:
-                rejected = {"answer": answer, "claims": claims}
-            with rag.timed("extractive"):
-                answer, engine = await asyncio.to_thread(rag.extractive_answer, body.question, passages), "extractive"
-                claims = await asyncio.to_thread(rag.verify, answer, passages)
+        return await finish(answer, body.question, passages, start)
+
+
+@app.post("/ask/stream")
+async def ask_stream(body: AskRequest):
+    """Server-Sent Events: `sources` after retrieval, `token` while the model writes, then `final`
+    (same body as /ask). Tokens are a draft: if the checked answer fails, `final` replaces it."""
+    async def events():
+        start = time.perf_counter()
+        with rag.timed("ask_total"):
+            async with app.state.pool.acquire() as conn:
+                passages = await rag.search(conn, body.question)
+            yield sse("sources", sources(passages))
+            parts = []
+            try:
+                with rag.timed("llm"):
+                    async for token in rag.generate_stream(body.question, passages):
+                        if not parts:
+                            rag.record("first_token", time.perf_counter() - start)
+                        parts.append(token)
+                        yield sse("token", {"text": token})
+                answer = "".join(parts).strip() or None
+            except (httpx.HTTPError, ValueError):
+                answer = None  # model failed, possibly mid-answer: discard the draft
+            result = await finish(answer, body.question, passages, start)
+        yield sse("final", result)
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def sse(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def sources(passages: list[dict]) -> list[dict]:
+    return [{"n": i, "doc": p["doc"], "content": p["content"]} for i, p in enumerate(passages, start=1)]
+
+
+async def finish(answer: str | None, question: str, passages: list[dict], start: float) -> dict:
+    """Check the model's answer; fall back to an extractive one if it is missing or unsupported."""
+    with rag.timed("verify"):
+        claims = await asyncio.to_thread(rag.verify, answer, passages) if answer else []
+    engine, rejected = "qwen", None
+    # Guardrail: never return an LLM answer that is empty or fails verification; fall back to an
+    # extractive answer quoted from the top passages, and show what was rejected and why.
+    if answer is None or not rag.strip_citations(answer) or not all(c["supported"] for c in claims):
+        if answer is not None:
+            rejected = {"answer": answer, "claims": claims}
+        with rag.timed("extractive"):
+            answer, engine = await asyncio.to_thread(rag.extractive_answer, question, passages), "extractive"
+            claims = await asyncio.to_thread(rag.verify, answer, passages)
     verified = all(c["supported"] for c in claims)
     ANSWERS.labels(engine, str(verified).lower()).inc()
     # One structured line per request: grep/jq-able, no question text (may hold user data).
     log.info(json.dumps({"event": "ask", "engine": engine, "verified": verified,
                          "llm_rejected": rejected is not None, "passages": len(passages),
                          "ms": round((time.perf_counter() - start) * 1000, 1)}))
-    return {
-        "answer": answer,
-        "engine": engine,
-        "verified": verified,
-        "claims": claims,
-        "rejected_llm_answer": rejected,
-        "sources": [{"n": i, "doc": p["doc"], "content": p["content"]} for i, p in enumerate(passages, start=1)],
-    }
+    return {"answer": answer, "engine": engine, "verified": verified, "claims": claims,
+            "rejected_llm_answer": rejected, "sources": sources(passages)}

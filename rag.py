@@ -7,6 +7,7 @@ question -> vector search (pgvector) + keyword search (Postgres full-text)
 """
 import asyncio
 import hashlib
+import json
 import math
 import os
 import re
@@ -48,9 +49,12 @@ def timed(stage: str):
     try:
         yield
     finally:
-        seconds = time.perf_counter() - start
-        STAGE_SECONDS.labels(stage).observe(seconds)
-        SAMPLES[stage].append(seconds)
+        record(stage, time.perf_counter() - start)
+
+
+def record(stage: str, seconds: float):
+    STAGE_SECONDS.labels(stage).observe(seconds)
+    SAMPLES[stage].append(seconds)
 
 
 def percentile(values, q: float) -> float:
@@ -176,18 +180,35 @@ Question: {question}
 Answer:"""
 
 
-async def generate(question: str, passages: list[dict]) -> str | None:
-    """Qwen via Ollama. Returns None when the model is unavailable (caller falls back)."""
+async def generate_stream(question: str, passages: list[dict]):
+    """Yields Qwen's answer token by token (Ollama NDJSON stream). Raises httpx.HTTPError or
+    ValueError if the model fails, including mid-answer, so a cut-off answer is never used."""
     numbered = "\n\n".join(f"[{i}] {p['content']}" for i, p in enumerate(passages, start=1))
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
+                "model": OLLAMA_MODEL, "stream": True, "options": {"temperature": 0},
+                "prompt": PROMPT.format(passages=numbered, question=question)}) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                msg = json.loads(line)
+                if "error" in msg:
+                    raise ValueError(msg["error"])
+                if msg.get("response"):
+                    yield msg["response"]
+                if msg.get("done"):
+                    return
+    raise ValueError("model stream ended before done")
+
+
+async def generate(question: str, passages: list[dict]) -> str | None:
+    """Whole answer, or None when the model is unavailable or fails (caller falls back)."""
     try:
         with timed("llm"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(f"{OLLAMA_URL}/api/generate", json={
-                    "model": OLLAMA_MODEL, "stream": False, "options": {"temperature": 0},
-                    "prompt": PROMPT.format(passages=numbered, question=question)})
-        r.raise_for_status()
-        return r.json()["response"].strip() or None
-    except (httpx.HTTPError, KeyError, ValueError):
+            parts = [t async for t in generate_stream(question, passages)]
+        return "".join(parts).strip() or None
+    except (httpx.HTTPError, ValueError):
         return None
 
 

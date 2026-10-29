@@ -1,6 +1,8 @@
 import asyncio
+import json
 
 import asyncpg
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -157,3 +159,46 @@ def test_ask_exports_stage_latency_and_answer_metrics(client, monkeypatch):
     for stage in ("embed", "vector_db", "keyword_db", "rerank", "llm", "extractive", "ask_total"):
         assert f'rag_stage_seconds_count{{stage="{stage}"}}' in metrics
     assert 'rag_answers_total{engine="extractive",verified="true"}' in metrics
+
+
+def sse_events(body: str) -> list[tuple[str, dict]]:
+    out = []
+    for block in body.strip().split("\n\n"):
+        fields = dict(line.split(": ", 1) for line in block.splitlines())
+        out.append((fields["event"], json.loads(fields["data"])))
+    return out
+
+
+def test_ask_stream_sends_sources_then_tokens_then_checked_answer(client, monkeypatch):
+    async def grounded_stream(question, passages):
+        n = next(i for i, p in enumerate(passages, start=1) if "sick days" in p["content"])
+        for token in ["Employees get up to ", "10 paid sick days ", f"per year [{n}]."]:
+            yield token
+    monkeypatch.setattr(rag, "generate_stream", grounded_stream)
+    events = sse_events(client.post("/ask/stream", json={"question": "How many paid sick days do employees get?"}).text)
+    kinds = [e for e, _ in events]
+    assert kinds[0] == "sources" and kinds[-1] == "final" and set(kinds[1:-1]) == {"token"}
+    final = events[-1][1]
+    assert final["engine"] == "qwen" and final["verified"]
+    assert "".join(d["text"] for e, d in events if e == "token") == final["answer"]
+
+
+def test_ask_stream_discards_a_draft_cut_off_mid_answer(client, monkeypatch):
+    async def dying_stream(question, passages):
+        yield "Employees get 45 "
+        raise httpx.ReadTimeout("model stalled")
+    monkeypatch.setattr(rag, "generate_stream", dying_stream)
+    final = sse_events(client.post("/ask/stream", json={"question": "How many paid sick days do employees get?"}).text)[-1][1]
+    assert final["engine"] == "extractive" and final["verified"] and "45" not in final["answer"]
+
+
+def test_generate_rejects_a_model_stream_that_ends_before_done(monkeypatch):
+    lines = b'{"response": "Refunds take 5 days [1]."}\n'  # connection closed, no {"done": true}
+    real = httpx.AsyncClient
+    monkeypatch.setattr(rag.httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=lines))))
+    assert asyncio.run(rag.generate("How long do refunds take?", PASSAGES)) is None
+    done = lines + b'{"response": "", "done": true}\n'
+    monkeypatch.setattr(rag.httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=done))))
+    assert asyncio.run(rag.generate("How long do refunds take?", PASSAGES)) == "Refunds take 5 days [1]."
