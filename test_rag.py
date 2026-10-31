@@ -51,6 +51,9 @@ def test_split_claims_handles_citation_styles(answer, want):
     ("Refunds go back to the original payment method within 5 business days.", [False], "no valid citation"),
     ("Refunds go back to the original payment method within 5 business days [9].", [False], "no valid citation"),
     ("Support agents can approve refunds up to 900,000 KRW [1].", [False], "numbers not in the cited passage: 900000"),
+    ("Support agents cannot approve refunds [1].", [False], "cited passage contradicts it"),
+    ("Refunds must not go back to the original payment method [1].", [False], "cited passage contradicts it"),
+    ("Support agents are allowed to approve refunds up to 200,000 KRW [1].", [True], None),
     ("I don't know.", [], None),
 ])
 def test_verify_checks_each_claim_against_its_citation(answer, supported, reason):

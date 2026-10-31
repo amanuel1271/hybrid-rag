@@ -19,15 +19,21 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+import onnxruntime as ort
 from fastembed import TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
+from huggingface_hub import hf_hub_download
 from prometheus_client import Histogram
+from tokenizers import Tokenizer
 
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dims, runs locally on CPU
 RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+NLI_MODEL = "Xenova/nli-deberta-v3-xsmall"  # entailment cross-encoder, ONNX: runs on deps fastembed already brings
+NLI_REVISION = "2a4f614a701367a02d51389039afc998faeda637"  # pinned: scores feed test assertions
 CANDIDATES = 20  # per retriever, before fusion
 RRF_K = 60  # standard reciprocal-rank-fusion constant
 SUPPORT_MIN = 0.70  # calibrated: real cited claims 0.77-1.00 (median 0.88), unrelated sentences <= 0.67
+CONTRADICTION_MAX = 0.5  # veto only: real cited claims score <= 0.07, negated ones 0.99+; requiring "entailed" would reject 10/29 correct claims
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 MODEL_CACHE = os.environ.get("FASTEMBED_CACHE_PATH")
@@ -71,6 +77,26 @@ def embedder() -> TextEmbedding:
 @cache
 def reranker() -> TextCrossEncoder:
     return TextCrossEncoder(RERANK_MODEL, cache_dir=MODEL_CACHE)
+
+
+@cache
+def nli_model():
+    def get(f):
+        return hf_hub_download(NLI_MODEL, f, revision=NLI_REVISION, cache_dir=MODEL_CACHE)
+    tok = Tokenizer.from_file(get("tokenizer.json"))
+    tok.enable_truncation(512)
+    labels = {name: int(i) for i, name in json.load(open(get("config.json")))["id2label"].items()}
+    return tok, ort.InferenceSession(get("onnx/model_quantized.onnx")), labels
+
+
+def nli(premise: str, hypothesis: str) -> dict[str, float]:
+    """Probabilities that the premise entails / contradicts / is neutral to the hypothesis."""
+    tok, session, labels = nli_model()
+    enc = tok.encode(premise, hypothesis)
+    logits = session.run(None, {"input_ids": np.array([enc.ids]), "attention_mask": np.array([enc.attention_mask])})[0][0]
+    probs = np.exp(logits - logits.max())
+    probs /= probs.sum()
+    return {name: float(probs[i]) for name, i in labels.items()}
 
 
 def embed(texts: list[str]) -> list[np.ndarray]:
@@ -261,7 +287,7 @@ def citations(s: str) -> list[int]:
 
 
 def verify(answer: str, passages: list[dict]) -> list[dict]:
-    """Every sentence must cite a real passage, and be semantically close to what it cites."""
+    """Every sentence must cite a real passage, be semantically close to what it cites, and not be contradicted by it."""
     sentences = [s for s in split_claims(answer) if strip_citations(s).lower() != IDK.lower()]  # abstaining is not a claim
     claims = []
     for s in sentences:
@@ -276,8 +302,12 @@ def verify(answer: str, passages: list[dict]) -> list[dict]:
         best = max(float(sv @ ev) for ev in evs)
         # Embeddings barely notice numbers ("45 days" ~ "10 days"), so every number must appear verbatim.
         missing = numbers(text) - numbers(" ".join(passages[n - 1]["content"] for n in cited))
+        # Similarity can't see negation ("can" vs "cannot" scores ~0.74), so an entailment model gets a veto.
+        contradiction = nli(" ".join(evidence), text)["contradiction"] if best >= SUPPORT_MIN and not missing else None
         reason = ("cited passage does not support it" if best < SUPPORT_MIN
-                  else f"numbers not in the cited passage: {', '.join(sorted(missing))}" if missing else None)
+                  else f"numbers not in the cited passage: {', '.join(sorted(missing))}" if missing
+                  else "cited passage contradicts it" if contradiction > CONTRADICTION_MAX else None)
         claims.append({"sentence": text, "citations": cited, "supported": reason is None,
-                       "similarity": round(best, 3), "reason": reason})
+                       "similarity": round(best, 3),
+                       "contradiction": None if contradiction is None else round(contradiction, 3), "reason": reason})
     return claims

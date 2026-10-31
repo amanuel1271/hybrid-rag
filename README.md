@@ -62,7 +62,7 @@ Every pipeline stage is timed (`rag.timed`) into a Prometheus histogram, exporte
 | keyword search (Postgres FTS) | 0.2 | 0.5 | |
 | rerank (cross-encoder, up to 40 fused candidates) | 181 | 315 | the slowest non-LLM stage |
 | LLM answer (Qwen 2.5 3B) | 1,530 | 3,255 | |
-| claim check | 46 | 91 | |
+| claim check (similarity + contradiction) | 65 | 117 | was 46 / 91 before the NLI veto |
 | **whole `/ask`, with LLM** | **1,796** | **3,621** | |
 | whole `/ask`, extractive only | 235 | 487 | no LLM |
 
@@ -104,11 +104,14 @@ and increments `rag_answers_total{engine, verified}`, so the fallback rate can b
 |---|---|
 | Every sentence must cite a passage that was actually retrieved | `[n]` parsed per sentence; out-of-range or missing citations fail |
 | The cited passage must say what the sentence says | embedding similarity between the sentence and each sentence of the cited passage, threshold **0.70** |
+| The cited passage must not contradict it | an entailment (NLI) model reads the cited sentences and the claim; contradiction probability above **0.5** fails it. Similarity alone can't see negation: "agents **cannot** approve refunds" scores 0.74 against "agents **can** approve refunds" |
 | Numbers must be exact | every number in the claim must appear in the cited passage (embeddings treat "45 days" and "10 days" as near-identical) |
 | A failed or empty LLM answer is never returned | the API falls back to the most relevant sentence from the top passages, quoted verbatim, and returns the rejected answer alongside it |
 | "I don't know" is allowed | abstaining makes no claim, so it passes |
 
 The 0.70 threshold came from real Qwen answers: correctly cited claims scored 0.77–1.00 (median 0.88), and the same claims against unrelated passages scored at most 0.67.
+
+The contradiction check is a **veto, not a requirement**. On 29 real Qwen claims, contradiction scores were at most 0.07, while negated claims ("cannot", "must not") scored 0.99+. Requiring the model to say "entailed" instead would have rejected 10 of those 29 correct claims, because a small NLI model often calls a correct paraphrase "neutral". The model is [nli-deberta-v3-xsmall](https://huggingface.co/Xenova/nli-deberta-v3-xsmall) (ONNX, quantized), runs on the ONNX runtime fastembed already ships, and adds about 18 ms per answer (claim check p50 47 → 65 ms). Answer correctness on the eval is unchanged (0.89): no correct answer was rejected.
 
 ## Run it
 
@@ -151,12 +154,12 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-36 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), and streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`). Each key check was mutation-tested: removing fusion, reranking, the number check or the similarity threshold makes a test fail.
+39 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), and negated claims ("cannot", "must not") being rejected while a paraphrase passes. Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold or the contradiction veto makes a test fail.
 
 ## Trade-offs
 
 - **Small local models.** `bge-small` and a MiniLM cross-encoder run on a laptop CPU in milliseconds, but a larger embedding model would raise the vector-only baseline. Qwen 2.5 3B sometimes abstains or cites oddly; that's what the checker and fallback are for. Set `OLLAMA_MODEL=qwen2.5:7b` for better answers.
-- **Similarity is not entailment.** The checker catches answers that drift from their source and wrong numbers, but not every subtle contradiction ("must" vs "must not"). An NLI model would be the next step.
+- **Contradiction is vetoed, entailment isn't required.** The NLI model rejects claims the source contradicts ("must" vs "must not"), but an overclaim the source simply doesn't mention ("refunds of any size") is only caught if similarity drops. A larger NLI model could make "must be entailed" safe to require.
 - **The extractive fallback quotes one sentence.** It picked the answering sentence for 27 of the 35 golden questions; answers that need two sentences come out partial.
 - **Postgres full-text instead of BM25.** `ts_rank_cd` over an OR query is close enough here and keeps everything in one database; a dedicated BM25 index would rank long documents better.
 - **Model calls run in a thread pool** so one slow `/ask` doesn't block other requests; under real load they belong in a separate worker with batching.
@@ -169,7 +172,7 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Answer-quality eval + CI regression gate
 - [x] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
 - [x] Streaming answers (SSE), with the claim check still deciding the final answer
-- [ ] Entailment (NLI) claim check for "must" vs "must not"
+- [x] Entailment (NLI) contradiction veto for "must" vs "must not"
 - [ ] Multi-hop questions: let the model search again (tool use)
 - [ ] Document-level access control + prompt-injection guard for untrusted docs
 - [ ] Semantic cache + PDF/HTML ingest
