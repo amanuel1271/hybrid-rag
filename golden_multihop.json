@@ -1,0 +1,10 @@
+[
+ {"question": "If a credential leaks, how quickly must an incident commander be in place?", "docs": ["secrets-rotation.md", "incident-severity.md"], "facts": [["15 minutes"]]},
+ {"question": "After a credential leak, when is the written postmortem due?", "docs": ["secrets-rotation.md", "incident-severity.md"], "facts": [["3 business days"]]},
+ {"question": "For a leaked credential, how far back must the audit log be searched, and when is the postmortem due?", "docs": ["secrets-rotation.md", "incident-severity.md"], "facts": [["30 days"], ["3 business days"]]},
+ {"question": "Who has to approve a hotfix, and how quickly must the on-call primary acknowledge a page?", "docs": ["deploy-process.md", "oncall-runbook.md"], "facts": [["senior"], ["5 minutes"]]},
+ {"question": "A new engineer joins on-call as secondary in their first month. After how many minutes does an unacknowledged page escalate to them?", "docs": ["onboarding.md", "oncall-runbook.md"], "facts": [["10 minutes"]]},
+ {"question": "How long are proof-of-delivery photos kept, and how long are nightly database snapshots kept?", "docs": ["data-retention.md", "database-backups.md"], "facts": [["5 years"], ["35 days"]]},
+ {"question": "If customer data is exposed, how often must the status page be updated, and how long does the privacy team have to complete a deletion request?", "docs": ["incident-severity.md", "data-retention.md"], "facts": [["30 minutes"], ["30 days"]]},
+ {"question": "Which ticket queue handles production database access requests, and which handles API rate limit raises?", "docs": ["onboarding.md", "api-rate-limits.md"], "facts": [["ACCESS"], ["LIMITS"]]}
+]

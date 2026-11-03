@@ -4,6 +4,8 @@
   python eval.py           retrieval + extractive answers (no LLM needed)
   python eval.py --llm     also Qwen answers, raw and behind the guardrail (needs Ollama)
   python eval.py --check   fail (exit 1) if any metric drops below eval_baseline.json
+  python eval.py --multihop  use golden_multihop.json: each answer needs facts from 2 docs,
+                             and retrieval only counts a hit when every needed doc is retrieved
 
 Also prints per-stage latency (p50/p95). Not gated: CI machines vary too much for timing floors.
 """
@@ -19,7 +21,7 @@ from app import app
 
 HERE = Path(__file__).parent
 MODES = ["vector", "keyword", "hybrid", "rerank"]
-GOLDEN = json.loads((HERE / "golden.json").read_text())
+GOLDEN = json.loads((HERE / ("golden_multihop.json" if "--multihop" in sys.argv else "golden.json")).read_text())
 BASELINE = HERE / "eval_baseline.json"
 TOLERANCE = 0.005  # float noise only: any real drop on 35 questions is >= 1/35
 
@@ -28,8 +30,9 @@ def evaluate(client: TestClient, mode: str, k: int = 5) -> dict:
     hits1 = hitsk = rr = 0.0
     for case in GOLDEN:
         docs = [p["doc"] for p in client.get("/search", params={"q": case["question"], "mode": mode, "k": k}).json()]
-        if case["doc"] in docs:
-            rank = docs.index(case["doc"]) + 1
+        needed = case.get("docs") or [case["doc"]]
+        if all(d in docs for d in needed):
+            rank = max(docs.index(d) for d in needed) + 1  # rank of the last doc it needs
             hits1 += rank == 1
             hitsk += 1
             rr += 1 / rank
@@ -108,6 +111,8 @@ def report(results: dict) -> None:
 
 
 if __name__ == "__main__":
+    if "--multihop" in sys.argv and "--check" in sys.argv:
+        sys.exit("--check gates golden.json only; eval_baseline.json has no multi-hop floors")
     results = run(use_llm="--llm" in sys.argv)
     report(results)
     if "--check" in sys.argv:

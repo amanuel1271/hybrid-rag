@@ -51,6 +51,19 @@ Each golden question lists the facts a correct answer must contain (e.g. "10 min
 
 **CI gate:** `python eval.py --check` fails the build if any retrieval metric or extractive answer correctness drops below [`eval_baseline.json`](eval_baseline.json). Qwen metrics are checked locally (`--llm --check`), since CI has no LLM. Verified by breaking the extractive fallback: the gate exits 1 with `extractive.correct: 0.000 < baseline 0.770`.
 
+## Multi-hop questions: measured
+
+[`golden_multihop.json`](golden_multihop.json) has 8 questions whose answer needs facts from **two** docs ("If a credential leaks, how quickly must an incident commander be in place?" needs the rotation runbook *and* the severity table). `python eval.py --multihop` counts a retrieval hit only when **both** docs are in the top 5:
+
+| | result |
+|---|---|
+| retrieval, both docs in top 5 (keyword / hybrid / rerank) | **8/8** (vector alone: 7/8) |
+| extractive fallback | 1/8 (quotes one sentence, so it can only cover one doc) |
+| **Qwen 2.5 3B + guardrail** | **4/8** (vs 0.89 on single-doc questions) |
+| Qwen raw answers that pass the claim check | 6/8 |
+
+**Finding:** search is not the bottleneck. Both docs are already in the context every time; the 3B model fails to combine them: it answers one half, or attaches a number to the wrong half (says escalation to secondary takes 5 minutes, which is the primary's deadline). Letting the model search again (tool use) would fetch passages it already has. Prompt tweaks tried during this work raised multi-hop and lowered single-hop answers, so they were dropped. The next lever is a larger model, measured with the same `--multihop` set.
+
 ## Latency: measured
 
 Every pipeline stage is timed (`rag.timed`) into a Prometheus histogram, exported at `GET /metrics`, and `eval.py` prints p50/p95 from the same timings. Measured on a laptop (Apple M2 CPU, Docker), 35 golden questions through `/ask`:
@@ -173,7 +186,7 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Observability: per-stage latency (p50/p95), Prometheus metrics, structured logs
 - [x] Streaming answers (SSE), with the claim check still deciding the final answer
 - [x] Entailment (NLI) contradiction veto for "must" vs "must not"
-- [ ] Multi-hop questions: let the model search again (tool use)
+- [x] Multi-hop eval: retrieval finds both docs 8/8, the 3B model answers 4/8, so tool use is deferred until a larger model is measured
 - [ ] Document-level access control + prompt-injection guard for untrusted docs
 - [ ] Semantic cache + PDF/HTML ingest
 - [ ] Fine-tune the embedding model on the corpus and measure the lift
