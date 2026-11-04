@@ -18,6 +18,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://rag:rag@db:5432/rag
+      API_KEYS: ${API_KEYS:-{}}   # e.g. '{"my-eng-key": ["engineering"]}'; no key = public docs only
       OLLAMA_URL: http://host.docker.internal:11434   # Ollama on the host; unreachable -> extractive answers
     extra_hosts:
       - "host.docker.internal:host-gateway"

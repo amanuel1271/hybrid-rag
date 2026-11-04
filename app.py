@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Literal
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
@@ -19,6 +20,9 @@ import rag
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://rag:rag@localhost:55433/rag")
 DOCS_DIR = Path(os.environ.get("DOCS_DIR", Path(__file__).parent / "docs"))
+# API key -> extra groups, e.g. API_KEYS='{"key-for-eng-team": ["engineering"]}'. Groups come from the
+# server's key map, never from the request, so a caller can't claim a group it wasn't given.
+API_KEYS: dict[str, list[str]] = json.loads(os.environ.get("API_KEYS", "{}"))
 
 log = logging.getLogger("hybrid-rag")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -27,7 +31,9 @@ ANSWERS = Counter("rag_answers_total", "Answers returned by /ask", ["engine", "v
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL)
+    # iterative_scan: when the group filter drops HNSW candidates, keep scanning instead of returning
+    # fewer than LIMIT rows (pgvector >= 0.8); strict_order keeps the distance ordering exact.
+    app.state.pool = await asyncpg.create_pool(DATABASE_URL, server_settings={"hnsw.iterative_scan": "strict_order"})
     async with app.state.pool.acquire() as conn:
         await conn.execute((Path(__file__).parent / "schema.sql").read_text())
         app.state.ingested = await rag.ingest(conn, DOCS_DIR)
@@ -36,6 +42,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="hybrid-rag", lifespan=lifespan)
+
+
+def caller_groups(x_api_key: str | None = Header(None)) -> list[str]:
+    """No key: public docs only. Unknown key: 401, not a silent downgrade, so a typo'd key is noticed."""
+    if x_api_key is None:
+        return ["everyone"]
+    for key, groups in API_KEYS.items():
+        if secrets.compare_digest(key, x_api_key):
+            return ["everyone", *groups]
+    raise HTTPException(401, "unknown API key")
 
 
 class AskRequest(BaseModel):
@@ -57,30 +73,30 @@ def metrics():
 @app.get("/search")
 async def search(q: str = Query(min_length=2, max_length=500),
                  mode: Literal["vector", "keyword", "hybrid", "rerank"] = "rerank",
-                 k: int = Query(5, ge=1, le=20)):
+                 k: int = Query(5, ge=1, le=20), groups: list[str] = Depends(caller_groups)):
     async with app.state.pool.acquire() as conn:
-        return await rag.search(conn, q, mode, k)
+        return await rag.search(conn, q, mode, k, groups=groups)
 
 
 @app.post("/ask")
-async def ask(body: AskRequest):
+async def ask(body: AskRequest, groups: list[str] = Depends(caller_groups)):
     start = time.perf_counter()
     with rag.timed("ask_total"):
         async with app.state.pool.acquire() as conn:
-            passages = await rag.search(conn, body.question)
+            passages = await rag.search(conn, body.question, groups=groups)
         answer = await rag.generate(body.question, passages)
         return await finish(answer, body.question, passages, start)
 
 
 @app.post("/ask/stream")
-async def ask_stream(body: AskRequest):
+async def ask_stream(body: AskRequest, groups: list[str] = Depends(caller_groups)):
     """Server-Sent Events: `sources` after retrieval, `token` while the model writes, then `final`
     (same body as /ask). Tokens are a draft: if the checked answer fails, `final` replaces it."""
     async def events():
         start = time.perf_counter()
         with rag.timed("ask_total"):
             async with app.state.pool.acquire() as conn:
-                passages = await rag.search(conn, body.question)
+                passages = await rag.search(conn, body.question, groups=groups)
             yield sse("sources", sources(passages))
             parts = []
             try:

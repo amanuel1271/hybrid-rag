@@ -12,3 +12,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
 CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Document-level access control: who may read a chunk. '{}' (no one) until ingest sets it from docs/access.json.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS groups text[] NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS chunks_groups_idx ON chunks USING gin (groups);

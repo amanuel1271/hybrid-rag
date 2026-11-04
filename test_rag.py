@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import rag
+import app as app_module
 from app import DATABASE_URL, DOCS_DIR, app
 from eval import evaluate, is_correct, regressions
 
@@ -17,9 +18,18 @@ PASSAGES = [
 ]
 
 
+ENGINEERING_ONLY = {doc for doc, groups in json.loads((DOCS_DIR / "access.json").read_text()).items()
+                    if "everyone" not in groups}
+LEAKY_QUESTIONS = ["someone pushed an API key to GitHub by accident",
+                   "who must approve a hotfix deploy", "how fast must the on-call primary acknowledge a page"]
+
+
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
+    """Engineering key: reads every doc, so the existing retrieval and answer tests see the full corpus."""
+    app_module.API_KEYS["test-eng"] = ["engineering"]
+    app_module.API_KEYS["test-public"] = []  # same groups as no key: ["everyone"]
+    with TestClient(app, headers={"X-API-Key": "test-eng"}) as c:
         yield c
 
 
@@ -205,3 +215,50 @@ def test_generate_rejects_a_model_stream_that_ends_before_done(monkeypatch):
     monkeypatch.setattr(rag.httpx, "AsyncClient",
                         lambda **kw: real(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=done))))
     assert asyncio.run(rag.generate("How long do refunds take?", PASSAGES)) == "Refunds take 5 days [1]."
+
+
+def test_public_caller_never_retrieves_engineering_docs(client):
+    public = {"X-API-Key": "test-public"}
+    for q in LEAKY_QUESTIONS:
+        for mode in ("vector", "keyword", "hybrid", "rerank"):
+            docs = {p["doc"] for p in client.get("/search", params={"q": q, "mode": mode, "k": 20}, headers=public).json()}
+            assert not docs & ENGINEERING_ONLY, (q, mode, docs)
+    # the filter isn't just returning nothing: the engineering key does reach those docs
+    assert any(p["doc"] in ENGINEERING_ONLY for p in client.get("/search", params={"q": LEAKY_QUESTIONS[0]}).json())
+
+
+def test_public_caller_gets_no_answer_from_engineering_docs(client, monkeypatch):
+    monkeypatch.setattr(rag, "OLLAMA_URL", "http://127.0.0.1:9")  # extractive answer quotes what was retrieved
+    r = client.post("/ask", json={"question": LEAKY_QUESTIONS[0]}, headers={"X-API-Key": "test-public"}).json()
+    assert not {s["doc"] for s in r["sources"]} & ENGINEERING_ONLY
+    assert "SEV1" not in r["answer"]  # secrets-rotation.md: a leaked credential is a SEV1
+
+
+def test_no_key_reads_public_docs_and_unknown_key_is_rejected(client):
+    assert app_module.caller_groups(None) == ["everyone"]
+    assert app_module.caller_groups("test-public") == ["everyone"]
+    assert client.get("/search", params={"q": "refunds"}, headers={"X-API-Key": "nope"}).status_code == 401
+
+
+def test_ingest_fails_closed_on_doc_missing_from_access_list(tmp_path):
+    (tmp_path / "new-doc.md").write_text("# New\n\n## Part\nSecret stuff.")
+    (tmp_path / "access.json").write_text("{}")
+    with pytest.raises(ValueError, match="new-doc.md"):
+        asyncio.run(rag.ingest(None, tmp_path))  # raises before touching the database
+
+
+def test_each_search_layer_filters_on_its_own(client):
+    """Defence in depth: vector, keyword and fetch each filter by group, so one broken layer can't leak.
+    Checked layer by layer, since the end-to-end test passes as long as any single layer still filters."""
+    async def check():
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            restricted = {r["id"] for r in await conn.fetch(
+                "SELECT id FROM chunks WHERE doc = ANY($1::text[])", list(ENGINEERING_ONLY))}
+            for q in LEAKY_QUESTIONS:
+                assert not set(await rag.vector_search(conn, q, ["everyone"])) & restricted
+                assert not set(await rag.keyword_search(conn, q, ["everyone"])) & restricted
+            assert await rag.fetch_chunks(conn, sorted(restricted), ["everyone"]) == []
+        finally:
+            await conn.close()
+    asyncio.run(check())

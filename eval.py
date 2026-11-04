@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import rag
+import app as app_module
 from app import app
 
 HERE = Path(__file__).parent
@@ -78,7 +79,8 @@ def evaluate_answers(client: TestClient) -> dict:
 def run(use_llm: bool) -> dict:
     if not use_llm:
         rag.OLLAMA_URL = "http://127.0.0.1:9"  # nothing listens: every answer is extractive
-    with TestClient(app) as client:
+    app_module.API_KEYS["eval"] = ["engineering"]  # the golden set covers engineering-only docs too
+    with TestClient(app, headers={"X-API-Key": "eval"}) as client:
         results = {m: evaluate(client, m) for m in MODES}
         results["qwen+guardrail" if use_llm else "extractive"] = evaluate_answers(client)
     return results

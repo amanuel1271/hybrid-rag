@@ -1,0 +1,16 @@
+{
+  "api-rate-limits.md": ["everyone"],
+  "code-review.md": ["engineering"],
+  "data-retention.md": ["everyone"],
+  "database-backups.md": ["engineering"],
+  "deploy-process.md": ["engineering"],
+  "error-codes.md": ["everyone"],
+  "expense-policy.md": ["everyone"],
+  "feature-flags.md": ["engineering"],
+  "incident-severity.md": ["engineering"],
+  "onboarding.md": ["everyone"],
+  "oncall-runbook.md": ["engineering"],
+  "pto-policy.md": ["everyone"],
+  "refunds.md": ["everyone"],
+  "secrets-rotation.md": ["engineering"]
+}

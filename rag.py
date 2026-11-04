@@ -120,44 +120,61 @@ def chunk(text: str) -> list[str]:
     return chunks
 
 
+def load_access(docs_dir: Path, names: list[str]) -> dict[str, list[str]]:
+    """docs/access.json maps each doc to the groups allowed to read it. Fail closed: a doc
+    missing from the file stops ingest, so a new doc can't go live readable by everyone by accident."""
+    access = json.loads((docs_dir / "access.json").read_text())
+    missing = sorted(set(names) - access.keys())
+    if missing:
+        raise ValueError(f"docs missing from access.json: {missing}")
+    return {name: access[name] for name in names}
+
+
 async def ingest(conn, docs_dir: Path) -> int:
-    """Idempotent: unchanged sections are skipped by content hash; removed sections and files are deleted."""
+    """Idempotent: unchanged sections are skipped by content hash; removed sections and files are deleted.
+    Access groups are re-applied every run, so editing access.json takes effect without re-embedding."""
     added = 0
     paths = sorted(docs_dir.glob("*.md"))
+    access = load_access(docs_dir, [p.name for p in paths])
     await conn.execute("DELETE FROM chunks WHERE doc <> ALL($1::text[])", [p.name for p in paths])
     for path in paths:
         chunks = chunk(path.read_text())
         hashes = [hashlib.sha256(c.encode()).hexdigest() for c in chunks]
+        groups = access[path.name]
         known = {r["content_hash"] for r in await conn.fetch(
             "SELECT content_hash FROM chunks WHERE doc = $1", path.name)}
         new = [(c, h) for c, h in zip(chunks, hashes) if h not in known]
         for (content, h), vec in zip(new, embed([c for c, _ in new])):
             await conn.execute(
-                "INSERT INTO chunks (doc, content, content_hash, embedding) VALUES ($1, $2, $3, $4::vector)",
-                path.name, content, h, to_pgvector(vec))
+                "INSERT INTO chunks (doc, content, content_hash, embedding, groups) VALUES ($1, $2, $3, $4::vector, $5)",
+                path.name, content, h, to_pgvector(vec), groups)
         added += len(new)
         await conn.execute("DELETE FROM chunks WHERE doc = $1 AND content_hash <> ALL($2::text[])", path.name, hashes)
+        await conn.execute("UPDATE chunks SET groups = $2 WHERE doc = $1 AND groups <> $2", path.name, groups)
     return added
 
 
-async def vector_search(conn, question: str, limit: int = CANDIDATES) -> list[int]:
+# Every query filters on the caller's groups inside Postgres, so a restricted chunk never leaves the
+# database for a caller who can't read it: not in results, not in the LLM prompt.
+async def vector_search(conn, question: str, groups: list[str], limit: int = CANDIDATES) -> list[int]:
     with timed("embed"):
         [qv] = await asyncio.to_thread(embed, [question])
     with timed("vector_db"):
         rows = await conn.fetch(
-            "SELECT id FROM chunks ORDER BY embedding <=> $1::vector LIMIT $2", to_pgvector(qv), limit)
+            "SELECT id FROM chunks WHERE groups && $3::text[] ORDER BY embedding <=> $1::vector LIMIT $2",
+            to_pgvector(qv), limit, groups)
     return [r["id"] for r in rows]
 
 
-async def keyword_search(conn, question: str, limit: int = CANDIDATES) -> list[int]:
+async def keyword_search(conn, question: str, groups: list[str], limit: int = CANDIDATES) -> list[int]:
     # OR the question's terms (plainto_tsquery ANDs them, which misses on long questions);
     # ts_rank_cd then rewards chunks matching more terms, closer together.
     with timed("keyword_db"):
         rows = await conn.fetch(
             """SELECT id FROM chunks,
                       (SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS q) t
-               WHERE tsv @@ t.q ORDER BY ts_rank_cd(tsv, t.q) DESC LIMIT $2""",
-            question, limit)
+               WHERE tsv @@ t.q AND groups && $3::text[] ORDER BY ts_rank_cd(tsv, t.q) DESC LIMIT $2""",
+            question, limit, groups)
     return [r["id"] for r in rows]
 
 
@@ -170,23 +187,25 @@ def rrf(*rankings: list[int], k: int = RRF_K) -> list[int]:
     return sorted(scores, key=scores.get, reverse=True)
 
 
-async def fetch_chunks(conn, ids: list[int]) -> list[dict]:
-    rows = await conn.fetch("SELECT id, doc, content FROM chunks WHERE id = ANY($1::bigint[])", ids)
+async def fetch_chunks(conn, ids: list[int], groups: list[str]) -> list[dict]:
+    rows = await conn.fetch("SELECT id, doc, content FROM chunks WHERE id = ANY($1::bigint[]) AND groups && $2::text[]",
+                            ids, groups)
     by_id = {r["id"]: dict(r) for r in rows}
     return [by_id[i] for i in ids if i in by_id]
 
 
-async def search(conn, question: str, mode: str = "rerank", k: int = 5) -> list[dict]:
-    """mode: vector | keyword | hybrid (RRF) | rerank (RRF + cross-encoder). Returns top-k passages."""
+async def search(conn, question: str, mode: str = "rerank", k: int = 5, *, groups: list[str]) -> list[dict]:
+    """mode: vector | keyword | hybrid (RRF) | rerank (RRF + cross-encoder). Returns the top-k passages
+    the caller's groups may read. `groups` has no default on purpose: every caller must say who is asking."""
     if mode == "vector":
-        ids = await vector_search(conn, question)
+        ids = await vector_search(conn, question, groups)
     elif mode == "keyword":
-        ids = await keyword_search(conn, question)
+        ids = await keyword_search(conn, question, groups)
     elif mode in ("hybrid", "rerank"):
-        ids = rrf(await vector_search(conn, question), await keyword_search(conn, question))
+        ids = rrf(await vector_search(conn, question, groups), await keyword_search(conn, question, groups))
     else:
         raise ValueError(f"unknown search mode: {mode}")
-    passages = await fetch_chunks(conn, ids if mode == "rerank" else ids[:k])
+    passages = await fetch_chunks(conn, ids if mode == "rerank" else ids[:k], groups)
     if mode == "rerank" and passages:
         with timed("rerank"):
             scores = await asyncio.to_thread(lambda: list(reranker().rerank(question, [p["content"] for p in passages])))

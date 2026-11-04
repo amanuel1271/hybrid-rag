@@ -51,6 +51,20 @@ Each golden question lists the facts a correct answer must contain (e.g. "10 min
 
 **CI gate:** `python eval.py --check` fails the build if any retrieval metric or extractive answer correctness drops below [`eval_baseline.json`](eval_baseline.json). Qwen metrics are checked locally (`--llm --check`), since CI has no LLM. Verified by breaking the extractive fallback: the gate exits 1 with `extractive.correct: 0.000 < baseline 0.770`.
 
+## Access control: who can read which document
+
+Each document lists the groups allowed to read it in [`docs/access.json`](docs/access.json) (7 public docs, 7 `engineering`-only). Callers send an `X-API-Key`; the server maps it to groups (`API_KEYS='{"<key>": ["engineering"]}'`). No key means the public `everyone` group; an unknown key is a `401`, not a silent downgrade. Groups come only from the server's key map, so a caller can't claim one.
+
+| Rule | Enforced by |
+|---|---|
+| Restricted text never reaches a caller who can't read it, in results **or** in the LLM prompt | `WHERE groups && $caller_groups` in the vector search, the keyword search **and** the final fetch, inside Postgres |
+| One broken filter can't leak | Three independent filters; a test checks each layer on its own (breaking the keyword or fetch filter fails it) |
+| A new doc can't go live readable by everyone by accident | Ingest fails closed if a doc is missing from `access.json` |
+| Changing access doesn't need re-embedding | Ingest re-applies groups to unchanged chunks |
+| Filtering doesn't shrink vector results | `hnsw.iterative_scan = strict_order` (pgvector 0.8): the HNSW scan continues until `LIMIT` allowed rows are found |
+
+Tested: a public caller asking engineering questions ("someone pushed an API key to GitHub by accident") gets no engineering docs in any search mode, and `/ask` neither cites nor quotes them; the engineering key does reach them. Retrieval and answer quality are unchanged on the golden set (`eval.py --check`: no regressions).
+
 ## Multi-hop questions: measured
 
 [`golden_multihop.json`](golden_multihop.json) has 8 questions whose answer needs facts from **two** docs ("If a credential leaks, how quickly must an incident commander be in place?" needs the rotation runbook *and* the severity table). `python eval.py --multihop` counts a retrieval hit only when **both** docs are in the top 5:
@@ -167,7 +181,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-39 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), and negated claims ("cannot", "must not") being rejected while a paraphrase passes. Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold or the contradiction veto makes a test fail.
+44 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), negated claims ("cannot", "must not") being rejected while a paraphrase passes, and access control (a public caller never retrieves or is answered from engineering-only docs, each search layer filters on its own, unknown keys get 401, ingest fails closed on an unlisted doc). Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold, the contradiction veto or any one group filter makes a test fail.
 
 ## Trade-offs
 
@@ -187,6 +201,7 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Streaming answers (SSE), with the claim check still deciding the final answer
 - [x] Entailment (NLI) contradiction veto for "must" vs "must not"
 - [x] Multi-hop eval: retrieval finds both docs 8/8, the 3B model answers 4/8, so tool use is deferred until a larger model is measured
-- [ ] Document-level access control + prompt-injection guard for untrusted docs
+- [x] Document-level access control: groups per doc, enforced in every Postgres query
+- [ ] Prompt-injection guard for untrusted docs
 - [ ] Semantic cache + PDF/HTML ingest
 - [ ] Fine-tune the embedding model on the corpus and measure the lift
