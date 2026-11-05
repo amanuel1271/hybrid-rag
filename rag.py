@@ -224,15 +224,34 @@ If the passages do not contain the answer, reply exactly: I don't know.
 Question: {question}
 Answer:"""
 
+# Text that talks to the model instead of informing the reader. A retrieved passage that matches is
+# quarantined: dropped before the prompt and the extractive fallback, and reported back to the caller.
+# A regex catches the blunt attacks only; the claim check is the next layer (see README for what got through).
+INJECTION = re.compile(
+    r"\b(ignore|disregard|forget|override)\b.{0,40}\b(instructions?|prompts?|rules|guidelines|above|previous)\b"
+    r"|\byou are now\b|\bnew instructions\b|\bsystem prompt\b|\bdeveloper message\b"
+    r"|</?\s*(system|assistant|user|instructions?|passage)\s*>"
+    r"|\b(reply|respond|answer)\b.{0,20}\bonly with\b",
+    re.I | re.S)
 
-async def generate_stream(question: str, passages: list[dict]):
+
+def quarantine(passages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Splits passages into (clean, quarantined). Quarantined ones never reach the LLM or the answer."""
+    clean, dropped = [], []
+    for p in passages:
+        m = INJECTION.search(p["content"])
+        (dropped if m else clean).append(p if not m else {"doc": p["doc"], "reason": m.group(0)[:80]})
+    return clean, dropped
+
+
+async def generate_stream(question: str, passages: list[dict], prompt: str = PROMPT):
     """Yields Qwen's answer token by token (Ollama NDJSON stream). Raises httpx.HTTPError or
     ValueError if the model fails, including mid-answer, so a cut-off answer is never used."""
     numbered = "\n\n".join(f"[{i}] {p['content']}" for i, p in enumerate(passages, start=1))
     async with httpx.AsyncClient(timeout=60) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
                 "model": OLLAMA_MODEL, "stream": True, "options": {"temperature": 0},
-                "prompt": PROMPT.format(passages=numbered, question=question)}) as r:
+                "prompt": prompt.format(passages=numbered, question=question)}) as r:
             r.raise_for_status()
             async for line in r.aiter_lines():
                 if not line:
@@ -247,11 +266,11 @@ async def generate_stream(question: str, passages: list[dict]):
     raise ValueError("model stream ended before done")
 
 
-async def generate(question: str, passages: list[dict]) -> str | None:
+async def generate(question: str, passages: list[dict], **kw) -> str | None:
     """Whole answer, or None when the model is unavailable or fails (caller falls back)."""
     try:
         with timed("llm"):
-            parts = [t async for t in generate_stream(question, passages)]
+            parts = [t async for t in generate_stream(question, passages, **kw)]
         return "".join(parts).strip() or None
     except (httpx.HTTPError, ValueError):
         return None

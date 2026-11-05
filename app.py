@@ -27,6 +27,7 @@ API_KEYS: dict[str, list[str]] = json.loads(os.environ.get("API_KEYS", "{}"))
 log = logging.getLogger("hybrid-rag")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 ANSWERS = Counter("rag_answers_total", "Answers returned by /ask", ["engine", "verified"])
+QUARANTINED = Counter("rag_quarantined_passages_total", "Retrieved passages dropped as prompt-injection attempts")
 
 
 @asynccontextmanager
@@ -82,10 +83,9 @@ async def search(q: str = Query(min_length=2, max_length=500),
 async def ask(body: AskRequest, groups: list[str] = Depends(caller_groups)):
     start = time.perf_counter()
     with rag.timed("ask_total"):
-        async with app.state.pool.acquire() as conn:
-            passages = await rag.search(conn, body.question, groups=groups)
+        passages, dropped = await retrieve(body.question, groups)
         answer = await rag.generate(body.question, passages)
-        return await finish(answer, body.question, passages, start)
+        return await finish(answer, body.question, passages, start, dropped)
 
 
 @app.post("/ask/stream")
@@ -95,8 +95,7 @@ async def ask_stream(body: AskRequest, groups: list[str] = Depends(caller_groups
     async def events():
         start = time.perf_counter()
         with rag.timed("ask_total"):
-            async with app.state.pool.acquire() as conn:
-                passages = await rag.search(conn, body.question, groups=groups)
+            passages, dropped = await retrieve(body.question, groups)
             yield sse("sources", sources(passages))
             parts = []
             try:
@@ -109,10 +108,21 @@ async def ask_stream(body: AskRequest, groups: list[str] = Depends(caller_groups
                 answer = "".join(parts).strip() or None
             except (httpx.HTTPError, ValueError):
                 answer = None  # model failed, possibly mid-answer: discard the draft
-            result = await finish(answer, body.question, passages, start)
+            result = await finish(answer, body.question, passages, start, dropped)
         yield sse("final", result)
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+async def retrieve(question: str, groups: list[str]) -> tuple[list[dict], list[dict]]:
+    """Search, then quarantine passages that try to instruct the model (docs can be untrusted)."""
+    async with app.state.pool.acquire() as conn:
+        found = await rag.search(conn, question, groups=groups)
+    passages, dropped = rag.quarantine(found)
+    if dropped:
+        QUARANTINED.inc(len(dropped))
+        log.warning(json.dumps({"event": "quarantine", "docs": [d["doc"] for d in dropped]}))
+    return passages, dropped
 
 
 def sse(event: str, data) -> str:
@@ -123,7 +133,8 @@ def sources(passages: list[dict]) -> list[dict]:
     return [{"n": i, "doc": p["doc"], "content": p["content"]} for i, p in enumerate(passages, start=1)]
 
 
-async def finish(answer: str | None, question: str, passages: list[dict], start: float) -> dict:
+async def finish(answer: str | None, question: str, passages: list[dict], start: float,
+                 quarantined: list[dict] = ()) -> dict:
     """Check the model's answer; fall back to an extractive one if it is missing or unsupported."""
     with rag.timed("verify"):
         claims = await asyncio.to_thread(rag.verify, answer, passages) if answer else []
@@ -141,6 +152,7 @@ async def finish(answer: str | None, question: str, passages: list[dict], start:
     # One structured line per request: grep/jq-able, no question text (may hold user data).
     log.info(json.dumps({"event": "ask", "engine": engine, "verified": verified,
                          "llm_rejected": rejected is not None, "passages": len(passages),
+                         "quarantined": len(quarantined),
                          "ms": round((time.perf_counter() - start) * 1000, 1)}))
     return {"answer": answer, "engine": engine, "verified": verified, "claims": claims,
-            "rejected_llm_answer": rejected, "sources": sources(passages)}
+            "rejected_llm_answer": rejected, "quarantined": list(quarantined), "sources": sources(passages)}
