@@ -29,6 +29,7 @@ def client():
     """Engineering key: reads every doc, so the existing retrieval and answer tests see the full corpus."""
     app_module.API_KEYS["test-eng"] = ["engineering"]
     app_module.API_KEYS["test-public"] = []  # same groups as no key: ["everyone"]
+    app_module.CACHE_ENABLED = False  # tests below reuse questions with different stub models; cache tests opt in
     with TestClient(app, headers={"X-API-Key": "test-eng"}) as c:
         yield c
 
@@ -295,3 +296,97 @@ def test_ask_never_answers_from_an_injected_passage(client, monkeypatch):
     assert "PWNED" not in r["answer"]
     assert [q["doc"] for q in r["quarantined"]] == ["wiki-import.md"]
     assert all(s["doc"] != "wiki-import.md" for s in r["sources"])
+
+
+CACHE_PAIRS = json.loads((DOCS_DIR.parent / "golden_cache.json").read_text())
+
+
+def clear_cache():
+    async def run():
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            await conn.execute("TRUNCATE answer_cache")
+        finally:
+            await conn.close()
+    asyncio.run(run())
+
+
+@pytest.fixture
+def cache_on(client, monkeypatch):
+    monkeypatch.setattr(app_module, "CACHE_ENABLED", True)
+    monkeypatch.setattr(rag, "OLLAMA_URL", "http://127.0.0.1:9")  # extractive answers: deterministic, verified
+    clear_cache()
+    yield client
+    clear_cache()
+
+
+@pytest.mark.parametrize("a, b, want", [
+    ("How long are application logs kept?", "How long do we retain application logs?", True),
+    ("How many requests per second does a free account get?", "How many requests per second does a paid account get?", False),
+    ("What slowness counts as a SEV2?", "What slowness counts as a SEV3?", False),  # numbers differ
+    ("A customer's package went missing, what do they get back?", "A customer's package arrived damaged, what do they get back?", False),
+])
+def test_same_question_accepts_paraphrases_and_rejects_near_misses(a, b, want):
+    assert rag.same_question(a, b) is want
+
+
+def test_cache_matching_on_the_labeled_pairs():
+    """Gate on golden_cache.json: a wrong cache hit serves a confidently wrong answer, so near-misses must be 0."""
+    hits = sum(rag.same_question(a, b) for a, b in CACHE_PAIRS["same"])
+    false_hits = [(a, b) for a, b in CACHE_PAIRS["different"] if rag.same_question(a, b)]
+    assert false_hits == []
+    assert hits >= 12
+
+
+def test_paraphrase_is_served_from_cache(cache_on):
+    first = cache_on.post("/ask", json={"question": "How long are application logs kept?"}).json()
+    again = cache_on.post("/ask", json={"question": "How long do we retain application logs?"}).json()
+    assert first["cached"] is False and first["verified"]
+    assert again["cached"] is True and again["answer"] == first["answer"]
+    assert again["cached_question"] == "How long are application logs kept?"
+
+
+def test_near_miss_is_not_served_from_cache(cache_on):
+    cache_on.post("/ask", json={"question": "How many requests per second does a free account get?"})
+    r = cache_on.post("/ask", json={"question": "How many requests per second does a paid account get?"}).json()
+    assert r["cached"] is False
+
+
+def test_cache_never_crosses_access_groups(cache_on):
+    q = "How long are application logs kept?"
+    assert cache_on.post("/ask", json={"question": q}).json()["cached"] is False  # engineering key
+    public = cache_on.post("/ask", json={"question": q}, headers={"X-API-Key": "test-public"}).json()
+    assert public["cached"] is False
+
+
+def test_only_verified_answers_are_cached(cache_on):
+    async def run():
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            await rag.cache_put(conn, "q?", ["everyone"], "v1", {"answer": "x", "verified": False})
+            await rag.cache_put(conn, "q?", ["everyone"], "v1", {"answer": "x", "verified": True})
+            return await conn.fetchval("SELECT count(*) FROM answer_cache")
+        finally:
+            await conn.close()
+    assert asyncio.run(run()) == 1
+
+
+def test_cache_is_scoped_to_the_corpus_version(cache_on):
+    q = "How long are application logs kept?"
+    cache_on.post("/ask", json={"question": q})
+    async def lookup(corpus):
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            return await rag.cache_get(conn, q, ["everyone", "engineering"], corpus)
+        finally:
+            await conn.close()
+    assert asyncio.run(lookup(app_module.app.state.corpus)) is not None
+    assert asyncio.run(lookup("an-older-corpus")) is None
+
+
+def test_numbers_must_match_even_if_nli_says_same(monkeypatch):
+    """Backstop: NLI already rejects SEV2 vs SEV3 on our pairs, but a wrong hit here serves a wrong
+    error code's answer, so differing numbers never match regardless of the model."""
+    monkeypatch.setattr(rag, "nli", lambda a, b: {"entailment": 1.0, "contradiction": 0.0, "neutral": 0.0})
+    assert rag.same_question("What does SHP-4031 mean?", "What does SHP-4031 mean?") is True
+    assert rag.same_question("What does SHP-4031 mean?", "What does SHP-4090 mean?") is False

@@ -33,6 +33,8 @@ NLI_REVISION = "2a4f614a701367a02d51389039afc998faeda637"  # pinned: scores feed
 CANDIDATES = 20  # per retriever, before fusion
 RRF_K = 60  # standard reciprocal-rank-fusion constant
 SUPPORT_MIN = 0.70  # calibrated: real cited claims 0.77-1.00 (median 0.88), unrelated sentences <= 0.67
+CACHE_MIN_COS = 0.85  # candidate gate only: true paraphrases measured 0.84-0.97, but near-misses reach 0.955 (golden_cache.json)
+CACHE_MIN_ENTAIL = 0.70  # NLI entailment both ways: paraphrases that pass score 0.73-0.99, every near-miss <= 0.37
 CONTRADICTION_MAX = 0.5  # veto only: real cited claims score <= 0.07, negated ones 0.99+; requiring "entailed" would reject 10/29 correct claims
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
@@ -349,3 +351,43 @@ def verify(answer: str, passages: list[dict]) -> list[dict]:
                        "similarity": round(best, 3),
                        "contradiction": None if contradiction is None else round(contradiction, 3), "reason": reason})
     return claims
+
+
+# --- Semantic answer cache -------------------------------------------------------------------
+# Embedding similarity alone can't tell "free account" from "paid account" (cosine 0.955), so the
+# vector index only proposes candidates; a hit also needs identical numbers and NLI entailment in
+# both directions. Measured on golden_cache.json: 12/20 paraphrases hit, 0/20 near-misses.
+
+def same_question(a: str, b: str) -> bool:
+    if numbers(a) != numbers(b):
+        return False
+    return min(nli(a, b)["entailment"], nli(b, a)["entailment"]) >= CACHE_MIN_ENTAIL
+
+
+async def corpus_version(conn) -> str:
+    """Changes whenever a chunk or its access groups change, so cached answers never outlive their sources."""
+    return await conn.fetchval(
+        "SELECT md5(coalesce(string_agg(doc || content_hash || array_to_string(groups, ','), '|' ORDER BY doc, content_hash), ''))"
+        " FROM chunks")
+
+
+async def cache_get(conn, question: str, groups: list[str], corpus: str) -> dict | None:
+    with timed("cache"):
+        vec = to_pgvector(embed([question])[0])
+        rows = await conn.fetch(
+            "SELECT id, question, result, 1 - (embedding <=> $1::vector) AS cos FROM answer_cache"
+            " WHERE corpus = $2 AND groups = $3 ORDER BY embedding <=> $1::vector LIMIT 3",
+            vec, corpus, sorted(groups))
+        for r in rows:
+            if r["cos"] >= CACHE_MIN_COS and await asyncio.to_thread(same_question, question, r["question"]):
+                await conn.execute("UPDATE answer_cache SET hits = hits + 1 WHERE id = $1", r["id"])
+                return {**json.loads(r["result"]), "cached_question": r["question"]}
+    return None
+
+
+async def cache_put(conn, question: str, groups: list[str], corpus: str, result: dict) -> None:
+    """Only verified answers are cached: a fallback or failed check is retried fresh next time."""
+    if result["verified"]:
+        await conn.execute(
+            "INSERT INTO answer_cache (question, embedding, groups, corpus, result) VALUES ($1, $2::vector, $3, $4, $5)",
+            question, to_pgvector(embed([question])[0]), sorted(groups), corpus, json.dumps(result))

@@ -79,6 +79,7 @@ def evaluate_answers(client: TestClient) -> dict:
 def run(use_llm: bool) -> dict:
     if not use_llm:
         rag.OLLAMA_URL = "http://127.0.0.1:9"  # nothing listens: every answer is extractive
+    app_module.CACHE_ENABLED = False  # measure fresh answers, not ones cached by an earlier run
     app_module.API_KEYS["eval"] = ["engineering"]  # the golden set covers engineering-only docs too
     with TestClient(app, headers={"X-API-Key": "eval"}) as client:
         results = {m: evaluate(client, m) for m in MODES}
