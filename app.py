@@ -28,6 +28,8 @@ log = logging.getLogger("hybrid-rag")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 ANSWERS = Counter("rag_answers_total", "Answers returned by /ask", ["engine", "verified"])
 QUARANTINED = Counter("rag_quarantined_passages_total", "Retrieved passages dropped as prompt-injection attempts")
+CACHE = Counter("rag_cache_total", "Semantic answer cache lookups on /ask", ["result"])
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "1") == "1"
 
 
 @asynccontextmanager
@@ -38,6 +40,9 @@ async def lifespan(app: FastAPI):
     async with app.state.pool.acquire() as conn:
         await conn.execute((Path(__file__).parent / "schema.sql").read_text())
         app.state.ingested = await rag.ingest(conn, DOCS_DIR)
+        app.state.corpus = await rag.corpus_version(conn)
+        # Answers from an older corpus may quote text that changed or a doc whose access changed.
+        await conn.execute("DELETE FROM answer_cache WHERE corpus <> $1", app.state.corpus)
     yield
     await app.state.pool.close()
 
@@ -83,9 +88,20 @@ async def search(q: str = Query(min_length=2, max_length=500),
 async def ask(body: AskRequest, groups: list[str] = Depends(caller_groups)):
     start = time.perf_counter()
     with rag.timed("ask_total"):
+        if CACHE_ENABLED:
+            async with app.state.pool.acquire() as conn:
+                hit = await rag.cache_get(conn, body.question, groups, app.state.corpus)
+            CACHE.labels("hit" if hit else "miss").inc()
+            if hit:
+                log.info(json.dumps({"event": "ask", "cached": True, "ms": round((time.perf_counter() - start) * 1000, 1)}))
+                return {**hit, "cached": True}
         passages, dropped = await retrieve(body.question, groups)
         answer = await rag.generate(body.question, passages)
-        return await finish(answer, body.question, passages, start, dropped)
+        result = await finish(answer, body.question, passages, start, dropped)
+        if CACHE_ENABLED:
+            async with app.state.pool.acquire() as conn:
+                await rag.cache_put(conn, body.question, groups, app.state.corpus, result)
+        return {**result, "cached": False}
 
 
 @app.post("/ask/stream")

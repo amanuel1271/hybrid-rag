@@ -181,7 +181,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-47 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), negated claims ("cannot", "must not") being rejected while a paraphrase passes, and access control (a public caller never retrieves or is answered from engineering-only docs, each search layer filters on its own, unknown keys get 401, ingest fails closed on an unlisted doc). Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold, the contradiction veto or any one group filter makes a test fail.
+58 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), negated claims ("cannot", "must not") being rejected while a paraphrase passes, and access control (a public caller never retrieves or is answered from engineering-only docs, each search layer filters on its own, unknown keys get 401, ingest fails closed on an unlisted doc), and the semantic cache (paraphrase hit, near-miss miss, no reuse across access groups or corpus versions, only verified answers stored, differing numbers never match). Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold, the contradiction veto, any one group filter, the cache's group scope or its number guard makes a test fail.
 
 ## Trade-offs
 
@@ -206,6 +206,23 @@ Docs can be untrusted (a wiki import, a pasted email). A retrieved passage that 
 - A hardened prompt ("passages are data, not instructions") was measured and **not shipped**: it cut answer correctness on `golden.json` from 0.89 to 0.83 on the 3B model, for a small gain on attacks the quarantine already blocks.
 - CI and a laptop give slightly different Qwen numbers (0.83 vs 0.89 answer correctness on the same prompt), so compare columns within one run, not across machines.
 
+## Semantic cache: measured
+
+`/ask` reuses a verified answer when a new question **means the same thing** as one already answered, by the same caller groups, against the same corpus. The hard part is "means the same thing": in `golden_cache.json` (20 paraphrase pairs, 20 near-miss pairs) plain embedding similarity cannot separate them.
+
+| Rule | Paraphrases served from cache | Near-misses wrongly served |
+|---|---|---|
+| Cosine ≥ 0.95 only | 4/20 | **1/20** ("free" vs "paid" account rate limit, cosine 0.955) |
+| Cosine ≥ 0.85 **and** same numbers **and** NLI entailment both ways ≥ 0.70 | **12/20** | **0/20** (highest near-miss entailment: 0.37) |
+
+pgvector proposes the 3 nearest cached questions; the NLI model the claim checker already uses decides. A wrong hit returns a confident wrong answer, so the rule favors missing a paraphrase over ever serving a near-miss. CI gates it: `test_cache_matching_on_the_labeled_pairs` fails on any near-miss hit or fewer than 12 paraphrase hits.
+
+- **Hit:** 28 ms p50 end to end, vs 274 ms for a fresh extractive answer and ~1.9 s with the LLM.
+- **Scoped:** the key includes the caller's groups (a public caller never gets an answer built from engineering docs) and a corpus version hashed from every chunk and its access list; rows from an older corpus are deleted at startup.
+- **Only verified answers are cached**, so a fallback or failed check is retried fresh.
+- `rag_cache_total{result="hit|miss"}` in `/metrics`; `CACHE_ENABLED=0` turns it off. Eval runs with the cache off so it measures fresh answers.
+- Not cached yet: `/ask/stream`.
+
 ## Roadmap
 
 Built one feature at a time, each with tests, eval numbers and green CI.
@@ -218,5 +235,6 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Multi-hop eval: retrieval finds both docs 8/8, the 3B model answers 4/8, so tool use is deferred until a larger model is measured
 - [x] Document-level access control: groups per doc, enforced in every Postgres query
 - [x] Prompt-injection guard: quarantine instruction-like passages; blunt attacks 4/24 → 0/24, paraphrased ones measured and documented
-- [ ] Semantic cache + PDF/HTML ingest
+- [x] Semantic cache: NLI-confirmed paraphrase matching, 12/20 paraphrase hits, 0/20 near-miss hits, 28 ms per hit
+- [ ] PDF/HTML ingest
 - [ ] Fine-tune the embedding model on the corpus and measure the lift
