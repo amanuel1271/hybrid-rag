@@ -5,3 +5,4 @@ httpx==0.28.*
 prometheus-client==0.25.*
 fastembed==0.9.1  # pinned: model scores feed exact eval assertions
 pytest==9.*
+pypdf==6.*

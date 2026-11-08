@@ -1,5 +1,6 @@
 import asyncio
 import json
+from html import escape
 
 import asyncpg
 import httpx
@@ -37,6 +38,84 @@ def client():
 def test_chunk_one_per_section_with_title():
     chunks = rag.chunk("# Deploy Process\n\n## Canary\nFive percent.\n\n## Rollback\nThree minutes.\n")
     assert chunks == ["Deploy Process - Canary\nFive percent.", "Deploy Process - Rollback\nThree minutes."]
+
+
+def tiny_pdf(pages: list[str], title: str | None = None) -> bytes:
+    """Smallest valid PDF with one line of Helvetica text per page, so tests need no binary fixture."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            f"<< /Type /Pages /Kids [{' '.join(f'{4 + 2 * i} 0 R' for i in range(len(pages)))}] /Count {len(pages)} >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    for i, text in enumerate(pages):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+        objs += [f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> "
+                 f"/Contents {5 + 2 * i} 0 R >>", f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream"]
+    if title:
+        objs.append(f"<< /Title ({title}) >>")
+    out, offsets = b"%PDF-1.4\n", []
+    for n, obj in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj\n{obj}\nendobj\n".encode()
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
+    info = f" /Info {len(objs)} 0 R" if title else ""
+    return out + f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R{info} >>\nstartxref\n{xref}\n%%EOF\n".encode()
+
+
+def test_html_becomes_sections_and_drops_page_chrome(tmp_path):
+    page = tmp_path / "deploy.html"
+    page.write_text("""<html><head><title>ignored when h1 exists</title><style>p{color:red}</style></head>
+      <body><nav>Home | Docs</nav><h1>Deploy Process</h1>
+      <h2>Canary</h2><p>Five
+         percent.</p><ul><li>Watch errors</li></ul>
+      <script>track()</script><h2>Rollback</h2><p>Three minutes.</p><footer>(c) 2026</footer></body></html>""")
+    assert rag.chunk(rag.to_markdown(page)) == [
+        "Deploy Process - Canary\nFive percent.\n- Watch errors", "Deploy Process - Rollback\nThree minutes."]
+
+
+def test_html_without_h1_takes_title_tag(tmp_path):
+    page = tmp_path / "x.html"
+    page.write_text("<title>Refund Policy</title><h2>Window</h2><p>14 days.</p>")
+    assert rag.chunk(rag.to_markdown(page)) == ["Refund Policy - Window\n14 days."]
+
+
+def test_pdf_becomes_one_section_per_page_and_skips_blank_pages(tmp_path):
+    pdf = tmp_path / "travel-policy.pdf"
+    pdf.write_bytes(tiny_pdf(["Flights need approval.", "", "Hotels up to 150 USD."], title="Travel Policy"))
+    assert rag.chunk(rag.to_markdown(pdf)) == [
+        "Travel Policy - Page 1\nFlights need approval.", "Travel Policy - Page 3\nHotels up to 150 USD."]
+
+
+def test_pdf_without_title_metadata_uses_file_name(tmp_path):
+    pdf = tmp_path / "travel-policy.pdf"
+    pdf.write_bytes(tiny_pdf(["Flights need approval."]))
+    assert rag.chunk(rag.to_markdown(pdf)) == ["Travel Policy - Page 1\nFlights need approval."]
+
+
+def test_html_copy_of_every_doc_gives_identical_chunks(tmp_path):
+    """Same content as HTML must give the same chunks (so the same embeddings and retrieval) as the markdown."""
+    for md in sorted(DOCS_DIR.glob("*.md")):
+        html = []
+        for line in map(escape, md.read_text().splitlines()):  # real pages escape <, > and &
+            if line.startswith("## "):
+                html.append(f"<h2>{line[3:]}</h2>")
+            elif line.startswith("# "):
+                html.append(f"<h1>{line[2:]}</h1>")
+            elif line.startswith("- "):
+                html.append(f"<ul><li>{line[2:]}</li></ul>")
+            elif line.strip():
+                html.append(f"<p>{line}</p>")
+        page = tmp_path / md.with_suffix(".html").name
+        page.write_text("<html><body>\n" + "\n".join(html) + "\n</body></html>")
+        squash = lambda chunks: [" ".join(c.split()) for c in chunks]
+        assert squash(rag.chunk(rag.to_markdown(page))) == squash(rag.chunk(md.read_text())), md.name
+
+
+def test_ingest_fails_closed_on_pdf_or_html_missing_from_access_list(tmp_path):
+    (tmp_path / "access.json").write_text("{}")
+    (tmp_path / "handbook.pdf").write_bytes(tiny_pdf(["Hello."]))
+    with pytest.raises(ValueError, match="handbook.pdf"):
+        asyncio.run(rag.ingest(None, tmp_path))
 
 
 def test_rrf_rewards_agreement_between_retrievers():

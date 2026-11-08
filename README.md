@@ -181,7 +181,7 @@ docker compose up -d db
 docker compose run --rm -v "$PWD":/app api pytest -q
 ```
 
-58 tests: chunking, fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), negated claims ("cannot", "must not") being rejected while a paraphrase passes, and access control (a public caller never retrieves or is answered from engineering-only docs, each search layer filters on its own, unknown keys get 401, ingest fails closed on an unlisted doc), and the semantic cache (paraphrase hit, near-miss miss, no reuse across access groups or corpus versions, only verified answers stored, differing numbers never match). Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold, the contradiction veto, any one group filter, the cache's group scope or its number guard makes a test fail.
+64 tests: chunking, HTML and PDF conversion (page chrome dropped, `<title>` fallback, one section per PDF page, HTML copies of all 14 docs give identical chunks), fusion, citation parsing (trailing, leading, dangling, `[1, 2]`, `[1-3]`, bullets), the claim checker, idempotent ingest, exact-code retrieval, the stage-by-stage eval, both answer engines, a hallucinated LLM answer being replaced, answer scoring, the regression gate, per-stage latency metrics (including a stage that raises), streaming (event order, a draft cut off mid-answer, a model stream that ends without `done`), negated claims ("cannot", "must not") being rejected while a paraphrase passes, and access control (a public caller never retrieves or is answered from engineering-only docs, each search layer filters on its own, unknown keys get 401, ingest fails closed on an unlisted doc), and the semantic cache (paraphrase hit, near-miss miss, no reuse across access groups or corpus versions, only verified answers stored, differing numbers never match). Each key check was mutation-tested: removing fusion, reranking, the number check, the similarity threshold, the contradiction veto, any one group filter, the cache's group scope or its number guard, or keeping HTML scripts, skipping entity decoding or ignoring `<title>` makes a test fail.
 
 ## Trade-offs
 
@@ -223,6 +223,14 @@ pgvector proposes the 3 nearest cached questions; the NLI model the claim checke
 - `rag_cache_total{result="hit|miss"}` in `/metrics`; `CACHE_ENABLED=0` turns it off. Eval runs with the cache off so it measures fresh answers.
 - Not cached yet: `/ask/stream`.
 
+## HTML and PDF docs
+
+Drop `.html` or `.pdf` files into `docs/` next to the markdown and list them in `access.json`. Each file is turned into the same `# title` / `## section` text the markdown uses, so chunking, content-hash re-ingest and access control work unchanged.
+
+- **HTML:** `<h1>` is the title (or `<title>` when there is no `<h1>`), each `<h2>` starts a section, list items stay as bullets. Navigation, headers, footers, scripts and styles are dropped. Parsed with Python's built-in `html.parser`, no new dependency.
+- **PDF:** PDFs carry no reliable headings, so each page is one section ("Policy - Page 3"). The title comes from the PDF metadata or the file name. Text extraction uses `pypdf`; scanned PDFs (images, no text layer) produce no chunks.
+- **Checked:** an HTML copy of every doc in the corpus produces exactly the same chunks as the markdown (14/14), so it gets the same embeddings and the same retrieval. A doc missing from `access.json` still stops ingest, whatever its format.
+
 ## Roadmap
 
 Built one feature at a time, each with tests, eval numbers and green CI.
@@ -236,5 +244,5 @@ Built one feature at a time, each with tests, eval numbers and green CI.
 - [x] Document-level access control: groups per doc, enforced in every Postgres query
 - [x] Prompt-injection guard: quarantine instruction-like passages; blunt attacks 4/24 → 0/24, paraphrased ones measured and documented
 - [x] Semantic cache: NLI-confirmed paraphrase matching, 12/20 paraphrase hits, 0/20 near-miss hits, 28 ms per hit
-- [ ] PDF/HTML ingest
+- [x] HTML and PDF ingest: same chunks as markdown for every doc (14/14), page-level sections for PDFs
 - [ ] Fine-tune the embedding model on the corpus and measure the lift

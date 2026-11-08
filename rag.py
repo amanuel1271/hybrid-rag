@@ -1,4 +1,4 @@
-"""Hybrid retrieval-augmented QA over a folder of markdown docs.
+"""Hybrid retrieval-augmented QA over a folder of markdown, HTML and PDF docs.
 
 question -> vector search (pgvector) + keyword search (Postgres full-text)
          -> reciprocal rank fusion -> cross-encoder rerank -> top passages
@@ -15,6 +15,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from functools import cache
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
@@ -24,6 +25,7 @@ from fastembed import TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from huggingface_hub import hf_hub_download
 from prometheus_client import Histogram
+from pypdf import PdfReader
 from tokenizers import Tokenizer
 
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dims, runs locally on CPU
@@ -122,6 +124,63 @@ def chunk(text: str) -> list[str]:
     return chunks
 
 
+class _HtmlText(HTMLParser):
+    """HTML -> the markdown shape chunk() expects: <h1> -> '# ', <h2> -> '## ', list items -> '- ',
+    other blocks -> their own line. Page chrome (nav, header, footer) and scripts/styles are dropped."""
+    SKIP = {"script", "style", "nav", "header", "footer", "noscript", "template"}
+    BLOCK = {"p", "div", "li", "br", "tr", "pre", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "table", "ul", "ol"}
+    PREFIX = {"h1": "# ", "h2": "## ", "li": "- "}
+
+    def __init__(self):
+        super().__init__()
+        self.parts, self.skipping, self.title, self.in_title = [], 0, "", False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skipping += 1
+        self.in_title = tag == "title"
+        if tag in self.BLOCK:
+            self.parts.append("\n" + self.PREFIX.get(tag, ""))
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skipping = max(0, self.skipping - 1)
+        self.in_title = False
+        if tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif not self.skipping:
+            self.parts.append(re.sub(r"\s+", " ", data))
+
+
+def html_to_markdown(html: str) -> str:
+    parser = _HtmlText()
+    parser.feed(html)
+    lines = [line.strip() for line in "".join(parser.parts).split("\n")]
+    text = "\n".join(line for line in lines if line and line not in ("#", "##", "-"))
+    if not text.startswith("# "):  # no <h1>: the <title> names the doc
+        text = f"# {' '.join(parser.title.split())}\n{text}"
+    return text
+
+
+def pdf_to_markdown(path: Path) -> str:
+    """PDFs carry no reliable headings, so each page becomes one section (chunk() drops blank ones)."""
+    reader = PdfReader(path)
+    title = (reader.metadata.title if reader.metadata else None) or path.stem.replace("-", " ").replace("_", " ").title()
+    return f"# {title}\n" + "\n".join(f"## Page {n}\n{(page.extract_text() or '').strip()}"
+                                       for n, page in enumerate(reader.pages, 1))
+
+
+LOADERS = {".md": Path.read_text, ".html": lambda p: html_to_markdown(p.read_text()), ".pdf": pdf_to_markdown}
+
+
+def to_markdown(path: Path) -> str:
+    return LOADERS[path.suffix.lower()](path)
+
+
 def load_access(docs_dir: Path, names: list[str]) -> dict[str, list[str]]:
     """docs/access.json maps each doc to the groups allowed to read it. Fail closed: a doc
     missing from the file stops ingest, so a new doc can't go live readable by everyone by accident."""
@@ -136,11 +195,11 @@ async def ingest(conn, docs_dir: Path) -> int:
     """Idempotent: unchanged sections are skipped by content hash; removed sections and files are deleted.
     Access groups are re-applied every run, so editing access.json takes effect without re-embedding."""
     added = 0
-    paths = sorted(docs_dir.glob("*.md"))
+    paths = sorted(p for p in docs_dir.iterdir() if p.suffix.lower() in LOADERS)
     access = load_access(docs_dir, [p.name for p in paths])
     await conn.execute("DELETE FROM chunks WHERE doc <> ALL($1::text[])", [p.name for p in paths])
     for path in paths:
-        chunks = chunk(path.read_text())
+        chunks = chunk(to_markdown(path))
         hashes = [hashlib.sha256(c.encode()).hexdigest() for c in chunks]
         groups = access[path.name]
         known = {r["content_hash"] for r in await conn.fetch(
